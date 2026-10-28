@@ -1265,3 +1265,77 @@
     max-width: 150px;
   }
 }
+
+/* ══════════ 多关系：附加依赖字段 + 图例线型 ══════════ */
+.settings-row.inline.dep-extra {
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.check-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.check-inline input {
+  margin: 0;
+}
+
+/* 关系图例用中性灰：颜色通道留给「状态」，避免同一块图例自相矛盾 */
+.legend-edge.rel-solid {
+  border-color: #8f959e;
+  border-top-style: solid;
+}
+
+.legend-edge.rel-dashed {
+  border-color: #8f959e;
+  border-top-style: dashed;
+}
+
+.legend-edge.rel-dotted {
+  border-color: #8f959e;
+  border-top-style: dotted;
+}
+
+/* ══════════ 沉浸模式（宿主不允许真全屏时的兜底） ══════════ */
+.app-container.immersive {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: #fff;
+}
+
+.app-container.immersive .toolbar,
+.app-container.immersive .settings-bar,
+.app-container.immersive .toolbar-error,
+.app-container.immersive .sidebar {
+  display: none;
+}
+
+.app-container.immersive .graph-wrapper {
+  height: 100%;
+}
+
+.immersive-exit {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 10000;
+  padding: 7px 14px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #1f2329;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #d0d3d6;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(31, 35, 41, 0.16);
+  cursor: pointer;
+}
+
+.immersive-exit:hover {
+  border-color: #3370ff;
+  color: #3370ff;
+}

@@ -95,7 +95,7 @@ export function applyCollapse(
     (e) => kept.has(e.source) && kept.has(e.target),
   )
 
-  return { data: { nodes, edges }, info }
+  return { data: { ...data, nodes, edges }, info }
 }
 
 /** 该节点是否可以展开/折叠（有子任务或有多条依赖） */

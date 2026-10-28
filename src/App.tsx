@@ -15,7 +15,15 @@ import type {
   GraphApi,
 } from './types'
 import { LAYOUT_LABELS } from './components/graphShapes'
-import { ZOOM_MIN } from './components/graphZoom'
+import { WHEEL_ZOOM_MIN } from './components/graphZoom'
+import { resolveRelationStyles, lineDashCss } from './services/relationStyles'
+import { downloadPng, exportFileName } from './services/exportImage'
+import {
+  requestFullscreen,
+  exitFullscreen,
+  isFullscreen,
+  onFullscreenChange,
+} from './services/fullscreen'
 import { config } from './config'
 import './App.css'
 
@@ -29,7 +37,8 @@ function App() {
   const [tables, setTables] = useState<TableOption[]>([])
   const [tableId, setTableId] = useState('')
   const [fields, setFields] = useState<LinkFieldOption[]>([])
-  const [depFieldId, setDepFieldId] = useState('')
+  /** 参与绘制的依赖字段，第一个为主字段。多选 = 同时显示多种依赖关系 */
+  const [depFieldIds, setDepFieldIds] = useState<string[]>([])
   const [parentFieldId, setParentFieldId] = useState('')
   const [depRole, setDepRole] = useState<DependencyRole>('fieldIsPrereq')
   const [parentRole, setParentRole] = useState<ParentRole>('fieldIsParent')
@@ -39,10 +48,13 @@ function App() {
   const [layout, setLayout] = useState<LayoutMode>('dagre-tb')
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
   const graphApiRef = useRef<GraphApi>(null)
+  const appRef = useRef<HTMLDivElement>(null)
 
   const [recordCount, setRecordCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [loadStage, setLoadStage] = useState('正在连接多维表格…')
+  /** 大表分页读取进度：已读 N / M 条 */
+  const [readProgress, setReadProgress] = useState('')
   /** 长时间停在加载态时的提示（多半是在普通浏览器里直接打开了部署地址） */
   const [slowHint, setSlowHint] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
@@ -53,6 +65,10 @@ function App() {
   const [toast, setToast] = useState<string | null>(null)
   const [filter, setFilter] = useState<ChecklistFilter>({})
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  /** iframe 内沉浸模式（宿主不允许真全屏时的兜底） */
+  const [immersive, setImmersive] = useState(false)
+  const [nativeFull, setNativeFull] = useState(false)
 
   const [collapse, setCollapse] = useState<CollapseState>(EMPTY_COLLAPSE)
   const [liveTick, setLiveTick] = useState(0)
@@ -70,7 +86,7 @@ function App() {
 
   const showToast = useCallback((text: string) => {
     setToast(text)
-    window.setTimeout(() => setToast(null), 2800)
+    window.setTimeout(() => setToast(null), 3200)
   }, [])
 
   // ── 启动 ──
@@ -116,7 +132,7 @@ function App() {
     if (!tableId) return
     let cancelled = false
     setFields([])
-    setDepFieldId('')
+    setDepFieldIds([])
     setParentFieldId('')
     setGraphData(null)
     ;(async () => {
@@ -126,20 +142,22 @@ function App() {
         setFields(list)
 
         const saved = configRef.current
-        const savedDep = list.find((f) => f.id === saved?.dependencyFieldId)
-        if (savedDep) {
-          setDepFieldId(savedDep.id)
+        const savedDeps = (saved?.dependencyFieldIds ?? []).filter((id) =>
+          list.some((f) => f.id === id),
+        )
+        if (savedDeps.length > 0) {
+          setDepFieldIds(savedDeps)
           setParentFieldId(list.find((f) => f.id === saved?.parentFieldId)?.id ?? '')
           return
         }
         const dep = list.find((f) => /前置|依赖|先|block|prereq/i.test(f.name)) ?? list[0]
         const parent = list.find((f) => /父|parent|子/i.test(f.name) && f.id !== dep?.id)
-        setDepFieldId(dep?.id ?? '')
+        setDepFieldIds(dep ? [dep.id] : [])
         setParentFieldId(parent?.id ?? '')
         if (dep) {
           persist({
             tableId,
-            dependencyFieldId: dep.id,
+            dependencyFieldIds: [dep.id],
             parentFieldId: parent?.id,
           })
         }
@@ -152,21 +170,46 @@ function App() {
     }
   }, [tableId, service, persist])
 
+  const primaryDepFieldId = depFieldIds[0] ?? ''
+  const parentField = fields.find((f) => f.id === parentFieldId)
+
+  /** 构建设置：命名空间 + 多条依赖关系 + 可选父子关系 */
+  const buildOptions = useCallback(
+    () => ({
+      namespace: tableId,
+      dependencyRelations: depFieldIds.map((id) => ({
+        relationId: id,
+        label: fields.find((f) => f.id === id)?.name ?? id,
+        role: depRole,
+      })),
+      parentFieldId: showParent && parentFieldId ? parentFieldId : undefined,
+      parentRole,
+      parentLabel: parentField?.name ?? '父子',
+    }),
+    [tableId, depFieldIds, fields, depRole, showParent, parentFieldId, parentRole, parentField],
+  )
+
+  const onReadProgress = useCallback((loaded: number, total?: number) => {
+    setReadProgress(total ? `已读 ${loaded} / ${total} 条` : `已读 ${loaded} 条`)
+  }, [])
+
   const analyze = useCallback(async () => {
-    if (!tableId || !depFieldId) return
+    if (!tableId || depFieldIds.length === 0) return
     const seq = ++analyzeSeq.current
     setAnalyzing(true)
     setError(null)
+    setReadProgress('')
 
     try {
       const tasks = await service.loadTasks(
         tableId,
-        depFieldId,
+        depFieldIds,
         showParent ? parentFieldId || undefined : undefined,
+        { onProgress: onReadProgress },
       )
       if (seq !== analyzeSeq.current) return
 
-      const data = service.buildGraphData(tasks, { dependencyRole: depRole, parentRole })
+      const data = service.buildGraphData(tasks, buildOptions())
 
       if (tasks.length === 0) throw new Error('这张表里没有任何记录。')
       if (data.nodes.length === 0) {
@@ -185,35 +228,41 @@ function App() {
       setError(err instanceof Error ? err.message : '分析失败')
       setGraphData(null)
     } finally {
-      if (seq === analyzeSeq.current) setAnalyzing(false)
+      if (seq === analyzeSeq.current) {
+        setAnalyzing(false)
+        setReadProgress('')
+      }
     }
-  }, [tableId, depFieldId, parentFieldId, showParent, depRole, parentRole, service])
+  }, [tableId, depFieldIds, parentFieldId, showParent, service, buildOptions, onReadProgress])
 
   /** 静默刷新：保留选中、折叠、缩放，只更新数据 */
   const silentAnalyze = useCallback(async () => {
-    if (!tableId || !depFieldId) return
+    if (!tableId || depFieldIds.length === 0) return
     const seq = ++analyzeSeq.current
     try {
       const tasks = await service.loadTasks(
         tableId,
-        depFieldId,
+        depFieldIds,
         showParent ? parentFieldId || undefined : undefined,
+        { onProgress: onReadProgress },
       )
       if (seq !== analyzeSeq.current) return
-      const data = service.buildGraphData(tasks, { dependencyRole: depRole, parentRole })
+      const data = service.buildGraphData(tasks, buildOptions())
       setRecordCount(tasks.length)
       setGraphData(data)
       // 不清空选中与折叠；选中的节点被删了才清
       setSelectedNode((prev) => (prev && data.nodes.some((n) => n.id === prev.id) ? prev : null))
     } catch {
       // 静默失败，保留旧图
+    } finally {
+      if (seq === analyzeSeq.current) setReadProgress('')
     }
-  }, [tableId, depFieldId, parentFieldId, showParent, depRole, parentRole, service])
+  }, [tableId, depFieldIds, parentFieldId, showParent, service, buildOptions, onReadProgress])
 
   // 实时监听表格变更
   useEffect(() => {
-    if (!liveOn || !tableId || !depFieldId || service.isMock) return
-    const relevant = [depFieldId, parentFieldId].filter(Boolean) as string[]
+    if (!liveOn || !tableId || depFieldIds.length === 0 || service.isMock) return
+    const relevant = [...depFieldIds, parentFieldId].filter(Boolean) as string[]
     let timer: number | undefined
     const stop = watchTable({ tableId, relevantFieldIds: relevant }, () => {
       window.clearTimeout(timer)
@@ -224,7 +273,7 @@ function App() {
       window.clearTimeout(timer)
       stop()
     }
-  }, [liveOn, tableId, depFieldId, parentFieldId, service.isMock])
+  }, [liveOn, tableId, depFieldIds, parentFieldId, service.isMock])
 
   useEffect(() => {
     if (liveTick === 0) return
@@ -233,12 +282,12 @@ function App() {
 
   const autoKey = useRef('')
   useEffect(() => {
-    if (!tableId || !depFieldId) return
-    const key = `${tableId}|${depFieldId}|${showParent ? parentFieldId : ''}|${depRole}|${parentRole}`
+    if (!tableId || depFieldIds.length === 0) return
+    const key = `${tableId}|${depFieldIds.join(',')}|${showParent ? parentFieldId : ''}|${depRole}|${parentRole}`
     if (autoKey.current === key) return
     autoKey.current = key
     void analyze()
-  }, [tableId, depFieldId, parentFieldId, showParent, depRole, parentRole, analyze])
+  }, [tableId, depFieldIds, parentFieldId, showParent, depRole, parentRole, analyze])
 
   /** 折叠后的视图 */
   const viewData = useMemo(
@@ -314,6 +363,62 @@ function App() {
     graphApiRef.current?.focus(node.id)
   }, [])
 
+  /** 整理前先清掉折叠：整理的语义是「恢复成一张完整、整齐的图」 */
+  const handleRequestArrange = useCallback(() => {
+    setCollapse(EMPTY_COLLAPSE)
+  }, [])
+
+  // ── 导出图片 ──
+  const handleExport = useCallback(async () => {
+    if (!graphData || exporting) return
+    setExporting(true)
+    try {
+      const dataUrl = await graphApiRef.current?.captureFullImage()
+      if (!dataUrl) throw new Error('图还没准备好')
+      const size = await downloadPng(dataUrl, exportFileName())
+      showToast(
+        size.scaled
+          ? `已导出 ${size.width}×${size.height}（原图过大，已等比压缩）`
+          : `已导出 ${size.width}×${size.height}`,
+      )
+    } catch (err) {
+      showToast(`导出失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setExporting(false)
+    }
+  }, [graphData, exporting, showToast])
+
+  // ── 全屏 / 沉浸模式 ──
+  useEffect(() => {
+    const off = onFullscreenChange(() => setNativeFull(isFullscreen()))
+    return off
+  }, [])
+
+  const toggleFullscreen = useCallback(async () => {
+    if (nativeFull) {
+      await exitFullscreen()
+      return
+    }
+    if (immersive) {
+      setImmersive(false)
+      return
+    }
+    const el = appRef.current
+    if (el && (await requestFullscreen(el))) return
+    // 宿主 iframe 没给 allowfullscreen 时走这里：至少把可用区域用满
+    setImmersive(true)
+    showToast('当前环境不允许真全屏，已切换为沉浸模式（按 Esc 退出）')
+  }, [nativeFull, immersive, showToast])
+
+  useEffect(() => {
+    if (!immersive) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setImmersive(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [immersive])
+
   // 加载超过 10 秒仍未拿到数据：多半是在普通浏览器里直接打开了部署地址，
   // 宿主 SDK 永不 resolve。给一条提示，避免看起来像卡死。
   useEffect(() => {
@@ -324,6 +429,18 @@ function App() {
     const timer = window.setTimeout(() => setSlowHint(true), 10000)
     return () => window.clearTimeout(timer)
   }, [loading])
+
+  // ── 图例：关系（线型）+ 状态（颜色）分开表达 ──
+  const relationStyles = useMemo(
+    () => resolveRelationStyles(graphData?.relations ?? []),
+    [graphData],
+  )
+  const legendRelations = useMemo(() => {
+    const order = (id: string) => relationStyles.get(id)?.order ?? 999
+    return [...(graphData?.relations ?? [])].sort(
+      (a, b) => order(a.relationId) - order(b.relationId),
+    )
+  }, [graphData, relationStyles])
 
   // ── 渲染 ──
   if (loading) {    return (
@@ -341,13 +458,14 @@ function App() {
     )
   }
 
-  const depField = fields.find((f) => f.id === depFieldId)
-  const parentField = fields.find((f) => f.id === parentFieldId)
+  const depField = fields.find((f) => f.id === primaryDepFieldId)
   const displayData = viewData?.data ?? graphData
   const collapsedCount = collapse.parents.size + collapse.deps.size
+  const extraDepFields = fields.filter((f) => f.id !== primaryDepFieldId)
+  const isImmersive = immersive || nativeFull
 
   return (
-    <div className="app-container">
+    <div className={`app-container ${isImmersive ? 'immersive' : ''}`} ref={appRef}>
       {/* ── 工具栏：主行 + 设置抽屉 ── */}
       <div className="toolbar">
         <label className="toolbar-item">
@@ -365,8 +483,28 @@ function App() {
           </select>
         </label>
 
-        <button className="analyze-button" onClick={analyze} disabled={analyzing || !depFieldId}>
+        <button className="analyze-button" onClick={analyze} disabled={analyzing || !primaryDepFieldId}>
           {analyzing ? '分析中…' : '刷新'}
+        </button>
+
+        <button
+          className="icon-button text"
+          onClick={handleExport}
+          disabled={!graphData || exporting}
+          title="导出整张图为 PNG（不受当前视口限制）"
+          aria-label="导出图片"
+        >
+          {exporting ? '导出中…' : '导出'}
+        </button>
+
+        <button
+          className={`icon-button text ${isImmersive ? 'active' : ''}`}
+          onClick={toggleFullscreen}
+          disabled={!graphData}
+          title="全屏（宿主不允许时降级为沉浸模式，Esc 退出）"
+          aria-label="全屏"
+        >
+          {isImmersive ? '退出' : '全屏'}
         </button>
 
         <button
@@ -388,9 +526,11 @@ function App() {
         </label>
 
         <span className="toolbar-stats">
-          {displayData
-            ? `${recordCount} 条 · ${displayData.nodes.length} 节点 · ${displayData.edges.length} 边`
-            : ''}
+          {analyzing && readProgress
+            ? readProgress
+            : displayData
+              ? `${recordCount} 条 · ${displayData.nodes.length} 节点 · ${displayData.edges.length} 边`
+              : ''}
         </span>
 
       </div>
@@ -411,10 +551,11 @@ function App() {
         <label className="settings-row inline">
           <span>依赖字段</span>
           <select
-            value={depFieldId}
+            value={primaryDepFieldId}
             onChange={(e) => {
-              setDepFieldId(e.target.value)
-              persist({ dependencyFieldId: e.target.value })
+              const next = [e.target.value, ...depFieldIds.slice(1).filter((id) => id !== e.target.value)]
+              setDepFieldIds(next)
+              persist({ dependencyFieldIds: next })
             }}
             disabled={analyzing || fields.length === 0}
           >
@@ -456,7 +597,7 @@ function App() {
               >
                 <option value="">无</option>
                 {fields
-                  .filter((f) => f.id !== depFieldId)
+                  .filter((f) => !depFieldIds.includes(f.id))
                   .map((f) => (
                     <option key={f.id} value={f.id}>
                       {f.name}
@@ -476,6 +617,28 @@ function App() {
               />
               <span>显示父子关系</span>
             </label>
+
+            {extraDepFields.length > 0 && (
+              <div className="settings-row inline dep-extra">
+                <span>同时显示</span>
+                {extraDepFields.map((f) => (
+                  <label key={f.id} className="check-inline">
+                    <input
+                      type="checkbox"
+                      checked={depFieldIds.includes(f.id)}
+                      onChange={(e) => {
+                        const next = e.target.checked
+                          ? [...depFieldIds, f.id].filter((v, i, a) => a.indexOf(v) === i)
+                          : depFieldIds.filter((id) => id !== f.id)
+                        setDepFieldIds(next)
+                        persist({ dependencyFieldIds: next })
+                      }}
+                    />
+                    <span>{f.name}</span>
+                  </label>
+                ))}
+              </div>
+            )}
           </>
         )}
       </div>
@@ -507,11 +670,13 @@ function App() {
               }}
               onCanvasClick={() => setSelectedNode(null)}
               onZoomChange={setZoom}
-              renderKey={`${tableId}|${depFieldId}|${parentFieldId}|${showParent}|${depRole}|${parentRole}`}
+              onRequestArrange={handleRequestArrange}
+              renderKey={`${tableId}|${depFieldIds.join(',')}|${parentFieldId}|${showParent}|${depRole}|${parentRole}`}
             />
             <div className="graph-statusbar">
               <span className="statusbar-left">
                 {depField ? `依赖：${depField.name}` : ''}
+                {depFieldIds.length > 1 && ` 等 ${depFieldIds.length} 个字段`}
                 {showParent && parentField ? `｜父子：${parentField.name}` : ''}
                 {collapsedCount > 0 && (
                   <button className="reset-collapse" onClick={() => setCollapse(EMPTY_COLLAPSE)}>
@@ -520,7 +685,11 @@ function App() {
                 )}
               </span>
               <span>
-                {zoom <= ZOOM_MIN + 0.01 && <span className="zoom-floor-hint">最小缩放</span>}
+                {zoom < WHEEL_ZOOM_MIN - 0.001 ? (
+                  <span className="zoom-floor-hint">整体视图</span>
+                ) : zoom <= WHEEL_ZOOM_MIN + 0.01 ? (
+                  <span className="zoom-floor-hint">最小缩放</span>
+                ) : null}
                 {Math.round(zoom * 100)}%
               </span>
             </div>
@@ -606,6 +775,16 @@ function App() {
                   )}
                 </div>
                 <div className="sidebar-legend">
+                  {legendRelations.map((r) => {
+                    const style = relationStyles.get(r.relationId)
+                    const dash = style ? lineDashCss(style) : 'solid'
+                    return (
+                      <div className="legend-item" key={r.relationId}>
+                        <span className={`legend-edge rel-${dash}`} />
+                        {r.label}
+                      </div>
+                    )
+                  })}
                   <div className="legend-item">
                     <span className="legend-edge dep-done" />
                     可推进：前置已完成
@@ -617,16 +796,6 @@ function App() {
                   <div className="legend-item">
                     <span className="legend-edge dep-idle" />
                     已失效：本任务已完成
-                  </div>
-                  {showParent && (
-                    <div className="legend-item">
-                      <span className="legend-edge parent" />
-                      父子关系
-                    </div>
-                  )}
-                  <div className="legend-item">
-                    <span className="legend-node terminal" />
-                    无前置
                   </div>
                 </div>
               </>
@@ -647,6 +816,19 @@ function App() {
             )}
           </div>
         )
+      )}
+
+      {isImmersive && (
+        <button
+          className="immersive-exit"
+          onClick={() => {
+            if (nativeFull) void exitFullscreen()
+            setImmersive(false)
+          }}
+          title="退出全屏（Esc）"
+        >
+          退出全屏
+        </button>
       )}
 
       {toast && <div className="toast">{toast}</div>}

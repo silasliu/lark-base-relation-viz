@@ -1,4 +1,13 @@
-import type { BaseTask, GraphNode, GraphEdge, GraphData, BuildOptions, LinkedTaskRef } from '../types'
+import type {
+  BaseTask,
+  GraphNode,
+  GraphEdge,
+  GraphData,
+  BuildOptions,
+  LinkedTaskRef,
+  DependencyRole,
+  GraphRelation,
+} from '../types'
 
 /** 视为「未完成」的状态值 */
 const INCOMPLETE_STATUSES = new Set(['打开', '进行中', 'open', 'in_progress', 'todo'])
@@ -42,55 +51,104 @@ function overdueDays(dueDate: string | undefined, isIncompleteTask: boolean): nu
   return diff > 0 ? diff : undefined
 }
 
+/** 一条依赖关系的解析结果 */
+interface ResolvedRelation {
+  relationId: string
+  label: string
+  role: DependencyRole
+}
+
+/**
+ * 把 BuildOptions 归一化成「一条或多条依赖关系」。
+ * 旧调用只给 dependencyRole 时，退化成一条默认关系。
+ */
+function resolveDependencyRelations(opts: BuildOptions): ResolvedRelation[] {
+  if (opts.dependencyRelations && opts.dependencyRelations.length > 0) {
+    return opts.dependencyRelations.map((r) => ({
+      relationId: r.relationId,
+      label: r.label,
+      role: r.role,
+    }))
+  }
+  return [
+    {
+      relationId: opts.dependencyFieldId ?? 'dependency',
+      label: opts.dependencyLabel ?? '依赖',
+      role: opts.dependencyRole ?? 'fieldIsPrereq',
+    },
+  ]
+}
+
 /**
  * 由任务列表构建依赖图。
  *
- * 节点 id 统一用 recordId —— 关联字段给出的就是 recordId，两者天然对齐。
+ * 节点 id 用「表命名空间 + recordId」：
+ * - 单表时 namespace 为空，id 仍然是 recordId（保持旧行为与旧配置兼容）
+ * - 多表时 id 变成 `${tableId}:${recordId}`，同名记录不会互相覆盖
  *
  * 图的构成：
  * - 种子：未完成、且（有依赖边 或 有父子边）的任务
  * - 闭包：沿依赖（前置/后继）与父子（父/子）双向扩展
- * - 依赖边：前置 → 任务，绿=前置已完成，红=未完成
+ * - 依赖边：任务 → 前置，颜色只表达状态
  * - 父子边：父 → 子，灰色虚线（不参与「未完成」种子判断，但参与闭包与展示）
  */
-/** 任务 → 可跳转引用 */
-function refOf(task: BaseTask | undefined): LinkedTaskRef | null {
-  if (!task) return null
-  return {
-    id: task.recordId,
-    title: stripEmoji(task.title) || task.title,
-    emoji: extractEmoji(task.title),
-    isIncomplete: isIncomplete(task.status),
-  }
-}
-
 export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): GraphData {
-  const dependencyRole = opts.dependencyRole ?? 'fieldIsPrereq'
+  const namespace = opts.namespace?.trim() ?? ''
+  const nodeId = (recordId: string) => (namespace ? `${namespace}:${recordId}` : recordId)
+
   const parentRole = opts.parentRole ?? 'fieldIsParent'
+  const relations = resolveDependencyRelations(opts)
 
   const taskMap = new Map<string, BaseTask>()
   for (const task of tasks) taskMap.set(task.recordId, task)
 
+  // 任务 → 可跳转引用
+  const refOf = (task: BaseTask | undefined): LinkedTaskRef | null => {
+    if (!task) return null
+    return {
+      id: nodeId(task.recordId),
+      title: stripEmoji(task.title) || task.title,
+      emoji: extractEmoji(task.title),
+      isIncomplete: isIncomplete(task.status),
+    }
+  }
+
   // ── 依赖边（仅指向表内记录） ──
-  // 字段语义可能是「前置」也可能是「后续」，这里统一归一化成 prereqMap: 任务 → 它的前置
+  // 字段语义可能是「前置」也可能是「后续」，这里统一归一化成 prereqMap: 任务 → 它的前置。
+  // 多条关系合并进 prereqMap 用于计数与闭包；depPairs 保留每条边的来源关系。
   const prereqMap = new Map<string, string[]>()
   for (const task of tasks) prereqMap.set(task.recordId, [])
-  const pushPrereq = (taskId: string, prereqId: string) => {
+  const depPairs: Array<{ taskId: string; prereqId: string; relationId: string }> = []
+  const seenPair = new Set<string>()
+
+  const addPair = (taskId: string, prereqId: string, relationId: string) => {
     if (taskId === prereqId || !taskMap.has(taskId) || !taskMap.has(prereqId)) return
     const list = prereqMap.get(taskId)!
     if (!list.includes(prereqId)) list.push(prereqId)
+    // 同一对记录只画一条边：多条关系指向同一对时，多重边会完全重叠，反而看不清
+    const pairKey = `${taskId}|${prereqId}`
+    if (seenPair.has(pairKey)) return
+    seenPair.add(pairKey)
+    depPairs.push({ taskId, prereqId, relationId })
   }
+
   for (const task of tasks) {
-    for (const ref of task.prerequisites ?? []) {
-      if (dependencyRole === 'fieldIsPrereq') {
-        // 字段存的是「我的前置」：本行 → ref
-        pushPrereq(task.recordId, ref)
-      } else {
-        // 字段存的是「我的后续」：ref 的前置是本行
-        pushPrereq(ref, task.recordId)
+    for (const relation of relations) {
+      const fromField = task.prerequisitesByField?.[relation.relationId]
+      // 旧数据只有合并后的 prerequisites 时，只在第一条关系上使用，避免重复计入
+      const refs = fromField ?? (relations.length === 1 ? task.prerequisites ?? [] : [])
+      for (const ref of refs) {
+        if (relation.role === 'fieldIsPrereq') {
+          // 字段存的是「我的前置」：本行 → ref
+          addPair(task.recordId, ref, relation.relationId)
+        } else {
+          // 字段存的是「我的后续」：ref 的前置是本行
+          addPair(ref, task.recordId, relation.relationId)
+        }
       }
     }
   }
+
   const dependentsMap = new Map<string, string[]>()
   for (const [id, prereqs] of prereqMap) {
     for (const prereqId of prereqs) {
@@ -182,7 +240,8 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
     const toRef = (id: string) => refOf(taskMap.get(id))
 
     nodes.push({
-      id: recordId,
+      id: nodeId(recordId),
+      namespace: namespace || undefined,
       recordId,
       label: title,
       emoji: extractEmoji(task.title),
@@ -219,26 +278,52 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
 
   // ── 边 ──
   // 依赖边方向：任务 → 前置（箭头指向「它在等的那件事」）。
-  // 单独保留 prerequisiteComplete 表示「前置是否已完成」，用于红/绿着色。
+  // 颜色只看状态；relationId 交给样式注册表决定线型与箭头。
   const edges: GraphEdge[] = []
-  for (const recordId of involved) {
-    for (const prereqId of prereqMap.get(recordId) ?? []) {
-      if (!involved.has(prereqId)) continue
-      edges.push({
-        source: recordId,
-        target: prereqId,
-        kind: 'dependency',
-        prerequisiteComplete: !isIncomplete(taskMap.get(prereqId)?.status),
-        sourceComplete: !isIncomplete(taskMap.get(recordId)?.status),
-      })
-    }
-    const parentId = parentMap.get(recordId)
-    if (parentId && involved.has(parentId)) {
-      edges.push({ source: parentId, target: recordId, kind: 'parent' })
-    }
+  for (const pair of depPairs) {
+    if (!involved.has(pair.taskId) || !involved.has(pair.prereqId)) continue
+    edges.push({
+      source: nodeId(pair.taskId),
+      target: nodeId(pair.prereqId),
+      kind: 'dependency',
+      relationId: pair.relationId,
+      prerequisiteComplete: !isIncomplete(taskMap.get(pair.prereqId)?.status),
+      sourceComplete: !isIncomplete(taskMap.get(pair.taskId)?.status),
+    })
   }
 
-  return { nodes, edges }
+  for (const recordId of involved) {
+    const parentId = parentMap.get(recordId)
+    if (!parentId || !involved.has(parentId)) continue
+    edges.push({
+      source: nodeId(parentId),
+      target: nodeId(recordId),
+      kind: 'parent',
+      relationId: opts.parentFieldId ?? 'parent',
+    })
+  }
+
+  // 只把真正出现在图里的关系交给图例与样式解析
+  const usedRelations: GraphRelation[] = []
+  const usedIds = new Set(edges.map((e) => e.relationId))
+  for (const relation of relations) {
+    if (usedIds.has(relation.relationId)) {
+      usedRelations.push({
+        relationId: relation.relationId,
+        kind: 'dependency',
+        label: relation.label,
+      })
+    }
+  }
+  if (opts.parentFieldId && usedIds.has(opts.parentFieldId)) {
+    usedRelations.push({
+      relationId: opts.parentFieldId,
+      kind: 'parent',
+      label: opts.parentLabel ?? '父子',
+    })
+  }
+
+  return { nodes, edges, relations: usedRelations }
 }
 
 /** 清单分组的依据 */

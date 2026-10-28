@@ -283,9 +283,11 @@ export function toG6Data(data: GraphData, compact = false) {
       }
     }),
     edges: data.edges.map((edge) => ({
-      id: `${edge.kind}:${edge.source}->${edge.target}`,
+      // relationId 进 id：同一对记录如果来自不同关系，不会被误判成同一条边
+      id: `${edge.relationId}:${edge.source}->${edge.target}`,
       source: edge.source,
       target: edge.target,
+      relationId: edge.relationId,
       prerequisiteComplete: edge.prerequisiteComplete,
       sourceComplete: edge.sourceComplete,
       kind: edge.kind,

@@ -1,13 +1,16 @@
 import type { Graph } from '@antv/g6'
 
 /**
- * 缩放下限。
+ * 缩放下限拆成两个，解决「缩不下去 / 显示全部显示不全」这对矛盾。
  *
- * 之前是 0.55，窄侧边栏里图大一点就「缩不下去也看不全」，很别扭。
- * 降到 0.2：小图仍按实际需要适配，大图可以一直缩到能看见全貌为止。
- * 这个比例下文字已经不可读，属于「看结构」而非「读内容」的档位，可以接受。
+ * - 手动滚轮：0.2。再小就彻底看不见自己看的是哪一块，属于防迷失下限。
+ * - 自动适配：0.02。「显示全部」的职责是把整张图塞进视口，
+ *   大图必须允许比手动下限更小，否则永远差一块。
+ *
+ * 之前两者共用一个 0.55，导致大图既缩不动、也适配不全。
  */
-export const ZOOM_MIN = 0.2
+export const WHEEL_ZOOM_MIN = 0.2
+export const FIT_ZOOM_MIN = 0.02
 /** 缩放上限：超过 2 倍后 12px 字渲染发虚，没意义 */
 export const ZOOM_MAX = 2
 
@@ -23,7 +26,11 @@ export const ZOOM_MAX = 2
  *   ratio = 2^(-Δpx / 260)
  * 滚 260px 缩放 2 倍，无论是触控板的小增量还是鼠标的大单步，口径一致。
  */
-export function attachWheelZoom(graph: Graph, container: HTMLElement): () => void {
+export function attachWheelZoom(
+  graph: Graph,
+  container: HTMLElement,
+  onUserZoom?: () => void,
+): () => void {
   /** 单次事件最大缩放倍数，防止某些设备一次发 deltaY=3000 */
   const MAX_STEP = 1.3
   /** 滚 260px 缩放 2 倍 */
@@ -70,10 +77,11 @@ export function attachWheelZoom(graph: Graph, container: HTMLElement): () => voi
     ratio = Math.min(MAX_STEP, Math.max(1 / MAX_STEP, ratio))
 
     const current = graph.getZoom()
-    const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, current * ratio))
+    const next = Math.min(ZOOM_MAX, Math.max(WHEEL_ZOOM_MIN, current * ratio))
     if (Math.abs(next - current) < 1e-6) return
 
     graph.zoomTo(next, toCanvasPoint(e.clientX, e.clientY))
+    onUserZoom?.()
   }
 
   // 必须 passive: false，否则 preventDefault 无效

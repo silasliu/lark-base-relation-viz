@@ -1,9 +1,9 @@
-import React, { useEffect, useRef, useImperativeHandle, forwardRef } from 'react'
+import React, { useEffect, useRef, useCallback, useImperativeHandle, forwardRef } from 'react'
 import G6, { Graph } from '@antv/g6'
 import type { GraphNode, GraphData, LayoutMode, GraphApi } from '../types'
 import { toG6Data, nodeDisplayLines, nodeMetricsFor } from './nodeMetrics'
-import { layoutConfig, registerShapes, isVerticalAxis, separateOverlaps, EDGE_WIDTH } from './graphShapes'
-import { attachWheelZoom, createZoomReporter, ZOOM_MIN, ZOOM_MAX } from './graphZoom'
+import { layoutConfig, registerShapes, isVerticalAxis, separateOverlaps, applyRelationStyles, edgeBaseWidth } from './graphShapes'
+import { attachWheelZoom, createZoomReporter, WHEEL_ZOOM_MIN, FIT_ZOOM_MIN, ZOOM_MAX } from './graphZoom'
 import './DependencyGraph.css'
 
 interface DependencyGraphProps {
@@ -16,6 +16,8 @@ interface DependencyGraphProps {
   collapsible?: (nodeId: string) => boolean
   onCanvasClick?: () => void
   onZoomChange?: (zoom: number) => void
+  /** 「整理」时先让上层清掉折叠状态，再由本组件重新布局 */
+  onRequestArrange?: () => void
   /** 变化时重建整张图（换表 / 刷新） */
   renderKey?: string
 }
@@ -47,34 +49,46 @@ function applyNodeMetrics(graph: Graph, compact: boolean): void {
 }
 
 /**
- * 适配整张图，但始终把最终缩放限制在 G6 的有效范围内。
+ * 适配整张图。
  *
- * G6 v4 的 fitView 在计算出小于 minZoom 的比例时仍会先调用 graph.zoom，
- * 于是控制台会出现 "zoom failed, ratio out of range"。这里复用它的计算
- * 逻辑，但直接使用夹紧后的绝对比例调用 zoomTo。
+ * 两个关键点：
+ * 1. 用 FIT_ZOOM_MIN（0.02）而不是手动下限 0.2 —— 「显示全部」的职责是
+ *    把整张图塞进视口，大图必须允许比手动缩得更小，否则永远差一块。
+ * 2. 小图不放大超过 100%：12px 字放大只会发虚，图也会显得空荡。
+ *
+ * G6 v4 的 fitView 在算出的比例小于 minZoom 时仍会先调用 zoom，
+ * 于是控制台出现 "zoom failed, ratio out of range"。这里自己算绝对比例再 zoomTo。
  */
-function fitGraph(graph: Graph, padding = 24): void {
+function fitGraph(graph: Graph, padding = 28): boolean {
   const group = graph.get('group') as any
+  if (!group) return false
   group.resetMatrix()
 
   const bbox = group.getCanvasBBox()
-  if (!bbox || bbox.width === 0 || bbox.height === 0) return
+  if (!bbox || !Number.isFinite(bbox.width) || !Number.isFinite(bbox.height)) return false
+  if (bbox.width <= 0 || bbox.height <= 0) return false
 
   const width = graph.getWidth()
   const height = graph.getHeight()
+  if (width <= 1 || height <= 1) return false
+
   const availableWidth = Math.max(1, width - padding * 2)
   const availableHeight = Math.max(1, height - padding * 2)
-  const ratio = Math.min(availableWidth / bbox.width, availableHeight / bbox.height)
-  const zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, ratio))
+  const raw = Math.min(availableWidth / bbox.width, availableHeight / bbox.height)
+  const zoom = Math.min(1, Math.max(FIT_ZOOM_MIN, raw))
+
   const viewCenter = { x: width / 2, y: height / 2 }
   const groupCenter = { x: bbox.x + bbox.width / 2, y: bbox.y + bbox.height / 2 }
 
   graph.translate(viewCenter.x - groupCenter.x, viewCenter.y - groupCenter.y)
   graph.zoomTo(zoom, viewCenter)
+  return true
 }
 
 /** 按 id 做 diff 同步，避免全量重建 */
 function syncGraphData(graph: Graph, data: GraphData, compact: boolean, vertical: boolean): boolean {
+  // 样式注册表必须在建模型之前刷新：draw() 会立刻按 relationId 取线型与箭头
+  applyRelationStyles(data.relations)
   const g6 = toG6Data(data, compact)
   const axis = vertical ? 'vertical' : 'horizontal'
   const wantNodes = new Map(g6.nodes.map((n) => [n.id, n]))
@@ -159,7 +173,7 @@ function syncGraphData(graph: Graph, data: GraphData, compact: boolean, vertical
 
 export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
   (
-    { data, layout, selectedId, onNodeClick, onNodeDoubleClick, onToggleCollapse, collapsible, onCanvasClick, onZoomChange, renderKey },
+    { data, layout, selectedId, onNodeClick, onNodeDoubleClick, onToggleCollapse, collapsible, onCanvasClick, onZoomChange, onRequestArrange, renderKey },
     ref,
   ) => {
     const containerRef = useRef<HTMLDivElement>(null)
@@ -185,28 +199,122 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
     const compactRef = useRef(false)
     /** 是否做过首次 fitView */
     const didFitRef = useRef(false)
+    /**
+     * 用户是否手动缩放过。
+     * 没手动缩放过时，容器尺寸变化要重新适配：否则「第一次 fit 发生在容器还没定型时」
+     * 会让整张图一直卡在错误比例上，看起来就是「显示不全」。
+     */
+    const userZoomRef = useRef(false)
     /** 缩放上报节流 */
     const zoomReporterRef = useRef<ReturnType<typeof createZoomReporter> | null>(null)
     if (!zoomReporterRef.current) {
       zoomReporterRef.current = createZoomReporter((z) => zoomRef.current?.(z))
     }
 
+    /** 适配请求的防抖定时器：布局可能连发多次，只在最后一次之后适配 */
+    const fitTimerRef = useRef<number | null>(null)
+
+    const runFit = useCallback(() => {
+      const graph = graphRef.current
+      if (!graph || graph.get('destroyed')) return
+      fitGraph(graph)
+      zoomReporterRef.current?.report(graph.getZoom())
+    }, [])
+
+    /**
+     * 延迟适配。为什么必须防抖：
+     * 「整理」会先清折叠（触发一次数据同步布局），再触发一次重新布局，
+     * 两次都会发出 afterlayout。每次都立刻 fit 会停在中间态，看起来就是「显示不全」。
+     */
+    const scheduleFit = useCallback(
+      (delay = 260) => {
+        if (fitTimerRef.current) window.clearTimeout(fitTimerRef.current)
+        fitTimerRef.current = window.setTimeout(() => {
+          fitTimerRef.current = null
+          runFit()
+        }, delay)
+      },
+      [runFit],
+    )
+
+    /**
+     * 整理：重新执行当前布局 + 消除重叠 + 适配全图。
+     * 与「显示全部」的区别：显示全部只动视口，整理会动布局。
+     */
+    const arrange = useCallback(() => {
+      const graph = graphRef.current
+      if (!graph || graph.get('destroyed')) return
+
+      let finished = false
+      let timer = 0
+      const finish = () => {
+        if (finished) return
+        finished = true
+        graph.off('afterlayout', onLayout)
+        window.clearTimeout(timer)
+        if (graph.get('destroyed')) return
+        separateOverlaps(graph)
+        // 布局刚结束，等一帧再算包围盒，避免拿到半更新的坐标
+        scheduleFit(60)
+      }
+      const onLayout = () => finish()
+
+      graph.on('afterlayout', onLayout)
+      // 兜底：个别布局不触发 afterlayout，也不能让「整理」点了没反应
+      timer = window.setTimeout(finish, 900)
+      graph.updateLayout(layoutConfig(layoutRef.current))
+    }, [scheduleFit])
+
     useImperativeHandle(ref, () => ({
       focus(nodeId: string) {
         const graph = graphRef.current
         if (!graph || graph.get('destroyed')) return
+        // 用户主动定位节点后，不再让 resize 自动重置视野
+        userZoomRef.current = true
         graph.focusItem(nodeId, true, { easing: 'easeCubic', duration: 300 })
         // getGraphCenterPoint() 是模型坐标，不能直接当 zoomTo 的中心
-        if (graph.getZoom() < ZOOM_MIN + 0.05) {
+        if (graph.getZoom() < WHEEL_ZOOM_MIN + 0.05) {
           graph.zoomTo(0.9, { x: graph.getWidth() / 2, y: graph.getHeight() / 2 })
         }
         zoomReporterRef.current?.report(graph.getZoom())
       },
       fit() {
+        runFit()
+      },
+      arrange() {
+        arrange()
+      },
+      captureFullImage() {
         const graph = graphRef.current
-        if (!graph || graph.get('destroyed')) return
-        fitGraph(graph)
-        zoomReporterRef.current?.report(graph.getZoom())
+        if (!graph || graph.get('destroyed')) {
+          return Promise.reject(new Error('图还没准备好'))
+        }
+        return new Promise<string>((resolve, reject) => {
+          let settled = false
+          const timer = window.setTimeout(() => {
+            if (settled) return
+            settled = true
+            reject(new Error('生成图片超时'))
+          }, 20000)
+          try {
+            graph.toFullDataURL(
+              (res: string) => {
+                if (settled) return
+                settled = true
+                window.clearTimeout(timer)
+                if (res) resolve(res)
+                else reject(new Error('导出的图片为空'))
+              },
+              'image/png',
+              { backgroundColor: '#ffffff', padding: 32 },
+            )
+          } catch (err) {
+            if (settled) return
+            settled = true
+            window.clearTimeout(timer)
+            reject(err instanceof Error ? err : new Error(String(err)))
+          }
+        })
       },
     }))
 
@@ -217,6 +325,7 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
 
       registerShapes()
       didFitRef.current = false
+      userZoomRef.current = false
       compactRef.current = container.clientWidth > 0 && container.clientWidth < 560
 
       const graph = new Graph({
@@ -231,7 +340,8 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
         defaultEdge: { type: 'dependency-edge' },
         layout: layoutConfig(layoutRef.current),
         animate: false,
-        minZoom: ZOOM_MIN,
+        // 下限必须用自动适配的那个：否则大图「显示全部」会被 G6 内部夹回 0.2
+        minZoom: FIT_ZOOM_MIN,
         maxZoom: ZOOM_MAX,
       })
 
@@ -240,7 +350,9 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
         ;(window as unknown as Record<string, unknown>).__depGraph = graph
       }
 
-      const detachWheel = attachWheelZoom(graph, container)
+      const detachWheel = attachWheelZoom(graph, container, () => {
+        userZoomRef.current = true
+      })
 
       let clickTimer: number | null = null
       let suppressClick = false
@@ -302,10 +414,11 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
           }
 
           g.changeSize(w, h)
-          if (!didFitRef.current) {
-            fitGraph(g)
+          // 用户没手动缩放过 → 容器变了就重新适配，保证整张图始终可见。
+          // 用户手动缩放过 → 尊重他的视野，不擅自重置。
+          if (!didFitRef.current || !userZoomRef.current) {
             didFitRef.current = true
-            zoomReporterRef.current?.report(g.getZoom())
+            scheduleFit(0)
           } else if (layoutIsSizeDependent(layoutRef.current)) {
             g.updateLayout(layoutConfig(layoutRef.current))
           }
@@ -318,6 +431,10 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
         detachWheel()
         if (clickTimer) window.clearTimeout(clickTimer)
         if (resizeTimer) window.clearTimeout(resizeTimer)
+        if (fitTimerRef.current) {
+          window.clearTimeout(fitTimerRef.current)
+          fitTimerRef.current = null
+        }
         ro.disconnect()
         zoomReporterRef.current?.dispose()
         zoomReporterRef.current = null
@@ -345,8 +462,8 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
         graph.off('afterlayout', afterLayout)
         if (graph.get('destroyed')) return
         if (layoutIsSizeDependent(layout)) separateOverlaps(graph)
-        fitGraph(graph)
-        zoomReporterRef.current?.report(graph.getZoom())
+        // 用防抖适配：切布局后可能还有一次数据同步布局，只在最后一次之后 fit
+        scheduleFit(60)
       }
       graph.on('afterlayout', afterLayout)
       graph.updateLayout(layoutConfig(layout))
@@ -354,7 +471,7 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
       return () => {
         graph.off('afterlayout', afterLayout)
       }
-    }, [layout])
+    }, [layout, scheduleFit])
 
     // ── 3. 数据同步 ──
     useEffect(() => {
@@ -366,9 +483,9 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
 
       const doFit = () => {
         if (graph.get('destroyed')) return
-        fitGraph(graph)
         didFitRef.current = true
-        zoomReporterRef.current?.report(graph.getZoom())
+        // 交给防抖：同一批数据可能触发多次布局
+        scheduleFit(80)
       }
 
       if (!didFitRef.current) {
@@ -377,11 +494,13 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
           doFit()
         }
         graph.on('afterlayout', afterLayout)
+        // 兜底：布局不触发 afterlayout 时也要适配。
+        // 之前是 150ms，早于 dagre 完成，拿到的是旧坐标 → 这就是「显示不全」的根因之一。
         const timer = window.setTimeout(() => {
           if (didFitRef.current) return
           graph.off('afterlayout', afterLayout)
           doFit()
-        }, 150)
+        }, 600)
 
         if (changed) graph.updateLayout(layoutConfig(layoutRef.current))
 
@@ -393,7 +512,7 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
 
       if (changed) graph.updateLayout(layoutConfig(layoutRef.current))
       return undefined
-    }, [data])
+    }, [data, scheduleFit])
 
     // ── 选中态 ──
     useEffect(() => {
@@ -412,8 +531,7 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
         for (const e of edges) {
           graph.setItemState(e, 'dim', false)
           graph.setItemState(e, 'highlight', false)
-          const isParent = (e.getModel() as any).kind === 'parent'
-          const base = isParent ? EDGE_WIDTH.parent : EDGE_WIDTH.dependency
+          const base = edgeBaseWidth(e.getModel() as any)
           const shape =
             e.get('group').find((s: any) => s.get('name') === 'edge-dependency') ||
             e.get('group').find((s: any) => s.get('name') === 'edge-parent')
@@ -449,8 +567,9 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
     const zoomBy = (factor: number) => {
       const graph = graphRef.current
       if (!graph || graph.get('destroyed')) return
-      const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, graph.getZoom() * factor))
+      const next = Math.min(ZOOM_MAX, Math.max(WHEEL_ZOOM_MIN, graph.getZoom() * factor))
       if (Math.abs(next - graph.getZoom()) < 1e-6) return
+      userZoomRef.current = true
       graph.zoomTo(next, { x: graph.getWidth() / 2, y: graph.getHeight() / 2 })
       zoomReporterRef.current?.report(next)
     }
@@ -467,16 +586,23 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
           </button>
           <button
             className="graph-ctrl-btn wide"
-            title="显示全部（图太大时会停在最小缩放，可拖动画布查看其余部分）"
+            title="显示全部：只把整张图塞进视口，不改变布局"
             aria-label="显示全部"
-            onClick={() => {
-              const g = graphRef.current
-              if (!g || g.get('destroyed')) return
-              fitGraph(g)
-              zoomReporterRef.current?.report(g.getZoom())
-            }}
+            onClick={runFit}
           >
             显示全部
+          </button>
+          <button
+            className="graph-ctrl-btn wide"
+            title="整理：展开全部节点、重新布局、消除重叠，再适配全图"
+            aria-label="整理布局"
+            onClick={() => {
+              // 先让上层清掉折叠状态，再重新布局；两件事都会触发一次布局，防抖适配只跑最后一次
+              onRequestArrange?.()
+              arrange()
+            }}
+          >
+            整理
           </button>
         </div>
       </div>

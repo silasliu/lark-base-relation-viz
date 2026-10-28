@@ -9,11 +9,23 @@ A read-only view of task dependencies and parent-child relations in a Feishu Bas
 - **Views** — dagre TB (default) / dagre LR / force / circular / radial.
 - **Nodes** — title, due date (red when overdue), blocking badge (`阻塞：N`, where N is the number of downstream unfinished tasks this task blocks **transitively**), **list** (blue chip) + tag chips (max 2 + `+N`); left bar red = incomplete, gray-green = done.
 - **Dependency edges** — **task → prerequisite**, the arrow points at what it is waiting for. Prerequisites are laid out **above** tasks, and anchors are picked dynamically from the two nodes' actual positions. Three states: red = prerequisite unfinished (blocking), green = prerequisite done (clear to start), gray = this task is done (relation no longer actionable).
+- **Several relations at once** — tick more link fields under 更多 → 同时显示. Colour always means *state*; relation identity is carried by **line style + arrow shape + width** (solid + filled triangle, dashed + open arrow, dotted + diamond). The legend lists exactly the relations present in the current graph.
 - **Parent-child edges** — parent → child, gray dashed, no arrow. **Can be turned off** in settings; when off, tasks that only have parent links no longer appear.
 - **Checklist** — ready / blocked / done / all, searchable by list and tag; click to focus the node.
 - **Details** — task body (description), clickable prerequisites/successors/parent/children, clickable list and tags (click to filter), web link and client link.
-- **Interaction** — click to select & highlight neighbours, double-click to open TickTick, right-click to collapse/expand, wheel zoom proportional to physical distance, fit-all button.
+- **Interaction** — click to select & highlight neighbours, double-click to open TickTick, right-click to collapse/expand, wheel zoom proportional to physical distance.
+- **显示全部 vs 整理** — *显示全部* only re-fits the current graph into the viewport (layout untouched). *整理* expands every collapsed node, re-runs the layout, separates overlaps, then fits — it is the "put this back in order" button.
+- **导出** — renders the **whole** graph (not just the visible area) to a PNG on a white background, capped at 4096px on the longest edge with proportional downscale, filename stamped with date and time.
+- **全屏** — tries the real Fullscreen API first; when the host iframe does not allow it, it falls back to an in-iframe immersive mode (toolbar and sidebar hidden, `Esc` to leave) so the button never does nothing.
 - **Sidebar** — collapsible; on narrow screens (Feishu side panel) it moves to the bottom, collapsed as a single row and expanded to the lower half, without covering the canvas.
+
+## Reading large tables
+
+`getRecordsByPage` is capped at 200 records per request, so larger tables are read page by page. The
+page token is the SDK's `PageToken`, which is a **number** — passing it back as a string makes the host
+reject the second request with `table operation parameter exception error`. `0` is a valid token and is
+not treated as "no more pages". While reading, the toolbar shows `已读 N / M 条`. Three guards stop
+runaway loops: repeated token, missing token with `hasMore`, and a page-count ceiling.
 
 ## Narrow containers (Feishu side panel)
 
@@ -22,7 +34,17 @@ A read-only view of task dependencies and parent-child relations in a Feishu Bas
 | ≥ 560px | normal (132–240 wide) | docked right, collapsible |
 | < 560px | **compact** (100–168 wide, tighter padding) | moves to the bottom, collapsed to one row |
 
-With `minZoom: 0.2` a large graph can be zoomed out until the whole structure is visible, and "fit all" uses the same floor. At very low zoom the text is unreadable by design — that is the overview level; the status bar shows "最小缩放".
+Zoom has **two** floors on purpose:
+
+| Action | Floor | Why |
+|---|---|---|
+| Wheel / +− buttons | `0.2` | past this you lose track of where you are |
+| 显示全部 / 整理 (auto fit) | `0.02` | fitting a large graph must be allowed to go smaller than manual zoom |
+
+At very low zoom the text is unreadable by design — that is the overview level, and the status bar
+shows `整体视图` instead of a misleading "最小缩放". Auto-fit never enlarges beyond 100%. If the user
+has not zoomed manually, the graph re-fits when the container resizes, so a first fit computed before
+the layout settled cannot leave the graph cropped.
 
 ## Shipping it to other people
 
@@ -95,18 +117,24 @@ npm run dev          # http://localhost:5173
 feishu-plugins/dependency-graph/
 ├── src/
 │   ├── config.ts                  # optional fields + TickTick search scheme
-│   ├── types.ts                   # data structures (incl. direction semantics)
-│   ├── App.tsx                    # toolbar / direction confirm / sidebar / dialog notice
+│   ├── types.ts                   # data structures (incl. direction semantics, relation ids)
+│   ├── App.tsx                    # toolbar / settings bar / sidebar / export / fullscreen
 │   ├── services/
 │   │   ├── BaseDataService.ts     # SDK reads (with mock fallback), cell normalization
-│   │   ├── ConfigStore.ts         # persisted config (table/fields/direction/layout)
-│   │   └── graphBuilder.ts        # pure logic: tasks -> graph + checklist (with flipping)
+│   │   ├── pagination.ts          # pure page reader (no SDK) — unit tested
+│   │   ├── relationStyles.ts      # relation -> line style/arrow registry — unit tested
+│   │   ├── configSchema.ts        # config v1 -> v2 migration — unit tested
+│   │   ├── exportImage.ts         # PNG sizing/download — sizing is unit tested
+│   │   ├── fullscreen.ts          # Fullscreen API with graceful rejection
+│   │   ├── ConfigStore.ts         # bridge persistence around configSchema
+│   │   └── graphBuilder.ts        # pure logic: tasks -> graph + checklist
 │   └── components/
-│       ├── DependencyGraph.tsx    # G6 graph: selection / dblclick / resize / zoom
+│       ├── DependencyGraph.tsx    # G6 graph: selection / dblclick / resize / fit / arrange
 │       ├── graphShapes.ts         # node & edge shapes, layouts, overlap separation
 │       ├── nodeMetrics.ts         # node content & sizing (width-aware, same font as draw)
 │       ├── ChecklistPanel.tsx     # checklist
 │       └── DetailsPanel.tsx       # details
+├── tests/                         # node --test, no extra dependencies
 ├── block.json                     # manifest (fill blockTypeID)
 ├── public/mock-data.json          # browser-debug snapshot (gitignored)
 └── vite.config.ts
@@ -116,6 +144,7 @@ feishu-plugins/dependency-graph/
 
 ```bash
 npm run typecheck    # type check
+npm test             # unit tests (node --test, Node 24 native TS)
 npm run build        # output in dist/
 ```
 
@@ -129,7 +158,15 @@ npm run build        # output in dist/
    diagonal edges badly (measured 159px deviation from the chord).
 4. **The parent-edge branch must `return`**, otherwise a second dependency edge is drawn on top,
    producing "gray dashed + red/green arrow" hybrids.
-5. **resize never resets zoom** — only the first load fits the graph, using the local `fitGraph` helper so G6 never receives a ratio below `minZoom`.
+5. **resize does not reset zoom once the user has zoomed** — but if the user never zoomed, a resize
+   re-fits, because a first fit computed before the layout settled would otherwise leave the graph cropped.
+6. **Fitting is debounced.** 整理 triggers two layouts (collapse reset + explicit relayout) and both emit
+   `afterlayout`; fitting on each one lands on an intermediate frame, which looks like "显示不全".
+7. **Page tokens stay numbers.** `String(pageToken)` breaks the second page on tables over 200 records.
+8. **Relation styling is a registry, not a branch.** Colours are reserved for state; new relations get a
+   line style from `relationStyles.ts` so no drawing code changes.
+9. **Node ids carry a table namespace** (`tableId:recordId`) when a namespace is supplied, so two tables
+   with colliding record ids cannot overwrite each other. Single-table ids stay plain `recordId`.
 
 ## Known limitations
 
@@ -140,6 +177,13 @@ npm run build        # output in dist/
 5. Only the first parent value is used.
 6. G6 v4; `radial`/`circular` overlaps are handled by a post-layout separation pass, which can leave
    small residue on very large graphs.
+7. **Multi-table display is not exposed yet.** The data model is ready (namespaced node ids, per-edge
+   `relationId`, config v2), but the UI still selects one table at a time.
+8. **Fullscreen depends on the host.** Feishu's iframe may not carry `allowfullscreen`; in that case the
+   immersive fallback is what you get, and it only fills the iframe, not the screen.
+9. **Export has a size ceiling.** Above 4096px on the longest edge the image is downscaled; very large
+   graphs are still capped by browser canvas area limits.
+10. Reading is serial, one page at a time — correct, but a very large table takes several round trips.
 
 ## References
 

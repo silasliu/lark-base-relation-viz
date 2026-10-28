@@ -1,5 +1,6 @@
 import G6 from '@antv/g6'
-import type { LayoutMode } from '../types'
+import type { LayoutMode, GraphRelation } from '../types'
+import { resolveRelationStyles, fallbackStyle, type RelationStyle } from '../services/relationStyles'
 import { TAG_CHIP, NODE_METRICS, NODE_METRICS_COMPACT } from './nodeMetrics'
 
 /** 飞书设计语言配色 */
@@ -26,8 +27,50 @@ export const COLOR = {
   edgeIdle: '#c9cdd4',
 } as const
 
-/** 边的基础线宽，用于状态恢复（不要写字面量） */
-export const EDGE_WIDTH = { dependency: 1.5, parent: 1.2 } as const
+/**
+ * 关系样式注册表：由 GraphData.relations 解析后存成模块级表。
+ *
+ * 为什么放模块级：G6 的 draw/setState 只拿到 cfg，拿不到 React 的 props。
+ * 图实例只有一个，切换数据前统一刷新这张表即可。
+ */
+let activeStyles = new Map<string, RelationStyle>()
+
+/** 每次同步数据前调用：把关系声明换成具体样式 */
+export function applyRelationStyles(relations: GraphRelation[]): void {
+  activeStyles = resolveRelationStyles(relations)
+}
+
+/** 取某条边的样式；数据没声明关系时按 kind 兜底 */
+export function styleForModel(model: { relationId?: string; kind?: string } | undefined): RelationStyle {
+  const relationId = model?.relationId
+  if (relationId) {
+    const hit = activeStyles.get(relationId)
+    if (hit) return hit
+  }
+  return fallbackStyle(model?.kind === 'parent' ? 'parent' : 'dependency')
+}
+
+/** 边的基准线宽（选中态恢复时用，不要写字面量） */
+export function edgeBaseWidth(model: { relationId?: string; kind?: string } | undefined): number {
+  return styleForModel(model).lineWidth
+}
+
+/** 按样式生成箭头配置；'none' 返回 undefined */
+function arrowConfig(style: RelationStyle, color: string): Record<string, unknown> | undefined {
+  switch (style.arrow) {
+    case 'none':
+      return undefined
+    case 'hollow':
+      // 空心三角：白色填充 + 状态色描边，用来区分第二种依赖关系
+      return { path: G6.Arrow.vee(9, 11, 0), d: 0, fill: '#ffffff', stroke: color, lineWidth: 1.3 }
+    case 'diamond':
+      return { path: G6.Arrow.diamond(10, 12, 0), d: 0, fill: color, stroke: color }
+    case 'filled':
+    default:
+      // 第三个参数是 offset：让箭头尖退后 2px，不被节点边框压平
+      return { path: G6.Arrow.triangle(7, 9, 2), d: 2, fill: color, stroke: color }
+  }
+}
 
 /** 环形/辐射布局的节点碰撞尺寸：按最大节点对角线给，避免圆周上互相压住 */
 const CIRCULAR_NODE_SIZE = 260
@@ -490,56 +533,44 @@ export function separateOverlaps(graph: any, gap = 16): void {
         if (!startPoint || !endPoint) return null
 
         const self = this as any
+        const style = styleForModel(cfg)
         const cps = self.getControlPoints ? self.getControlPoints(cfg) : []
         const path = cps.length >= 2
           ? self.getPath([startPoint, cps[0], cps[1], endPoint])
           : [['M', startPoint.x, startPoint.y], ['L', endPoint.x, endPoint.y]]
 
-        if (kind === 'parent') {
-          // 父子边：灰色虚线、无箭头。必须 return，否则会继续画第二条依赖边
-          return group.addShape('path', {
-            attrs: {
-              path,
-              stroke: COLOR.edgeParent,
-              lineWidth: EDGE_WIDTH.parent,
-              lineDash: [3, 3],
-              opacity: 0.9,
-            },
-            name: 'edge-parent',
-          })
-        }
-
-        // 三态着色，优先级：任务自身已完成 → 灰（关系已无行动意义）；
-        // 否则看前置：已完成=绿（通畅），未完成=红（正在阻塞）
+        // 颜色只表达状态，不表达关系：
+        // 父子关系固定灰；依赖关系三态着色，优先级「本任务已完成 → 灰」最高，
+        // 因为那时这条关系已经没有行动意义了。
         const strokeColor =
-          color ??
-          (sourceComplete
-            ? COLOR.edgeIdle
-            : prerequisiteComplete
-              ? COLOR.success
-              : COLOR.danger)
+          kind === 'parent'
+            ? COLOR.edgeParent
+            : color ??
+              (sourceComplete
+                ? COLOR.edgeIdle
+                : prerequisiteComplete
+                  ? COLOR.success
+                  : COLOR.danger)
+
+        const attrs: Record<string, unknown> = {
+          path,
+          stroke: strokeColor,
+          lineWidth: style.lineWidth,
+        }
+        if (style.lineDash) attrs.lineDash = style.lineDash
+        const arrow = arrowConfig(style, strokeColor)
+        if (arrow) attrs.endArrow = arrow
 
         return group.addShape('path', {
-          attrs: {
-            path,
-            stroke: strokeColor,
-            lineWidth: EDGE_WIDTH.dependency,
-            endArrow: {
-              // 第三个参数是 offset：让箭头尖退后 2px，不被节点边框压平
-              path: G6.Arrow.triangle(7, 9, 2),
-              d: 2,
-              fill: strokeColor,
-              stroke: strokeColor,
-            },
-          },
-          name: 'edge-dependency',
+          attrs,
+          name: kind === 'parent' ? 'edge-parent' : 'edge-dependency',
         })
       },
 
       setState(name: string, value: boolean, item: any) {
         if (name !== 'dim' && name !== 'highlight') return
         const group = item.get('group')
-        const isParent = item.getModel().kind === 'parent'
+        const style = styleForModel(item.getModel())
         const shape =
           group.find((s: any) => s.get('name') === 'edge-dependency') ||
           group.find((s: any) => s.get('name') === 'edge-parent')
@@ -549,9 +580,8 @@ export function separateOverlaps(graph: any, gap = 16): void {
           group.attr('opacity', value ? 0.06 : 1)
         }
         if (name === 'highlight') {
-          // 恢复时用基础线宽，不要写字面量（父边是 1.2，依赖边是 1.5）
-          const base = isParent ? EDGE_WIDTH.parent : EDGE_WIDTH.dependency
-          shape.attr('lineWidth', value ? base + 1 : base)
+          // 恢复时用关系自己的基准线宽，不要写字面量
+          shape.attr('lineWidth', value ? style.lineWidth + 1 : style.lineWidth)
         }
       },
     },

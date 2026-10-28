@@ -2,11 +2,12 @@ import { bitable, FieldType } from '@lark-base-open/js-sdk'
 import type { BaseTask, GraphData, TableOption, LinkFieldOption, BuildOptions } from '../types'
 import { config } from '../config'
 import { buildGraphData } from './graphBuilder'
+import { readAllPages } from './pagination'
 
 /**
  * 开发调试回退：在飞书宿主之外（浏览器直接打开）时，SDK 永不 resolve。
  * 此时加载 public/mock-data.json（从真实 Base 导出的快照，gitignore），
- * 让布局/交互可以在浏览器里直接调试。生产构建同样适用——宿主内永远不会走到这条路。
+ * 让布局/交互可以在浏览器里直接调试。生产构建刻意不打包它。
  */
 interface MockData {
   _comment?: string
@@ -48,7 +49,7 @@ function probablyInHost(): boolean {
 const PAGE_SIZE = 200
 
 /** SDK 在非宿主环境下可能永不 resolve，必须自己设超时兜底 */
-const HOST_TIMEOUT_MS = 10_000
+const HOST_TIMEOUT_MS = 15_000
 
 const HOST_TIMEOUT_MESSAGE =
   '连接多维表格宿主超时。这个页面需要作为「多维表格扩展程序」在飞书里打开，直接用浏览器访问是读不到表的。'
@@ -96,6 +97,15 @@ function cellToArray(value: unknown): string[] {
   return text ? [text] : []
 }
 
+/** 单元格看起来是不是「关联记录引用」：数组且至少一项带 recordIds/record_ids */
+function looksLikeLinkCell(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length === 0) return false
+  const first = value[0]
+  if (!first || typeof first !== 'object') return false
+  const link = first as { recordIds?: unknown; record_ids?: unknown }
+  return Array.isArray(link.recordIds) || Array.isArray(link.record_ids)
+}
+
 /** 关联字段 → recordId 列表（兼容 recordIds / record_ids 两种键名） */
 function cellToRecordIds(value: unknown): string[] {
   if (value == null) return []
@@ -130,6 +140,11 @@ function cellToDate(value: unknown): string | undefined {
   return text.slice(0, 10)
 }
 
+/** 读取进度回调 */
+export interface LoadProgress {
+  onProgress?: (loaded: number, total?: number) => void
+}
+
 /**
  * 读取多维表格并构建依赖图。
  * 插件运行在飞书宿主中，鉴权由宿主提供，无需 token。
@@ -155,12 +170,19 @@ export class BaseDataService {
   async listLinkFields(tableId: string): Promise<LinkFieldOption[]> {
     if (this.isMock) {
       const mock = await loadMock()
-      const dep = mock._fieldMeta?.find((f) => f.name === 'r前置')
-      const parent = mock._fieldMeta?.find((f) => f.name === '父记录')
-      const list: LinkFieldOption[] = []
-      if (dep) list.push({ id: dep.id, name: dep.name, targetTableId: tableId })
-      if (parent) list.push({ id: parent.id, name: parent.name, targetTableId: tableId })
-      return list
+      const metas = mock._fieldMeta ?? []
+      // 不写死字段名：扫一遍记录，凡是「值为 record 引用数组」的字段都算关联字段。
+      // 这样本地 mock 加一个新的依赖字段就能直接验证多关系，不用改代码。
+      const linkIds = new Set<string>()
+      for (const record of mock.records) {
+        for (const [fieldId, value] of Object.entries(record.fields)) {
+          if (linkIds.has(fieldId)) continue
+          if (looksLikeLinkCell(value)) linkIds.add(fieldId)
+        }
+      }
+      return metas
+        .filter((m) => linkIds.has(m.id))
+        .map((m) => ({ id: m.id, name: m.name, targetTableId: tableId }))
     }
     const table = await withTimeout(bitable.base.getTableById(tableId), HOST_TIMEOUT_MESSAGE)
     const metas = await withTimeout(table.getFieldMetaList(), HOST_TIMEOUT_MESSAGE)
@@ -179,14 +201,17 @@ export class BaseDataService {
   /**
    * 读取指定表的记录。
    * @param tableId 数据表
-   * @param dependencyFieldId 依赖字段（前置 → 任务，绿/红边）
+   * @param dependencyFieldIds 依赖字段（可多个，同时显示多种依赖关系）
    * @param parentFieldId 父子字段（父 → 子，灰虚线边），可空 = 不画父子
    */
   async loadTasks(
     tableId: string,
-    dependencyFieldId: string,
+    dependencyFieldIds: string[],
     parentFieldId?: string,
+    progress: LoadProgress = {},
   ): Promise<BaseTask[]> {
+    const depFieldIds = dependencyFieldIds.filter(Boolean)
+
     // 浏览器直开 → mock 快照（走与宿主完全相同的归一化路径，字段元数据从 _fieldMeta 取）
     if (this.isMock) {
       const mock = await loadMock()
@@ -205,7 +230,7 @@ export class BaseDataService {
         descriptionId: optional.descriptionCandidates
           .map((n) => idByName.get(n))
           .find((id) => Boolean(id)),
-        dependencyFieldId,
+        dependencyFieldIds: depFieldIds,
         parentFieldId,
       })
     }
@@ -216,10 +241,9 @@ export class BaseDataService {
     const idByName = new Map(metas.map((m) => [m.name, m.id]))
     const primary = metas.find((m) => m.isPrimary)
 
-    const titleId = primary?.id
     const optional = config.optionalFields
     const fieldIds = {
-      titleId,
+      titleId: primary?.id,
       statusId: idByName.get(optional.status),
       tagsId: idByName.get(optional.tags),
       dueId: idByName.get(optional.dueDate),
@@ -229,41 +253,37 @@ export class BaseDataService {
       descriptionId: optional.descriptionCandidates
         .map((n) => idByName.get(n))
         .find((id) => Boolean(id)),
-      dependencyFieldId,
+      dependencyFieldIds: depFieldIds,
       parentFieldId,
     }
 
-    const tasks: BaseTask[] = []
-    let pageToken: string | undefined
-    let pages = 0
+    type RawRecord = { recordId: string; fields: Record<string, unknown> }
 
-    do {
-      let page: {
-        records: Array<{ recordId: string; fields: Record<string, unknown> }>
-        hasMore: boolean
-        pageToken?: unknown
-      }
-      try {
-        page = await withTimeout(
+    // 分页令牌保持 SDK 的 number 类型；转成字符串会让宿主在第二页报参数非法
+    const records = await readAllPages<RawRecord>(
+      (pageToken) =>
+        withTimeout(
           table.getRecordsByPage({
             pageSize: PAGE_SIZE,
-            pageToken: pageToken as never,
-          }),
+            pageToken,
+          }) as Promise<{
+            records: RawRecord[]
+            hasMore: boolean
+            pageToken?: number
+            total?: number
+          }>,
           HOST_TIMEOUT_MESSAGE,
-        )
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err)
-        throw new Error(`读取记录失败（已读到 ${tasks.length} 条）：${reason}`)
-      }
+        ),
+      {
+        onProgress: progress.onProgress,
+        describeError: (err, loaded) => {
+          const reason = err instanceof Error ? err.message : String(err)
+          return `读取记录失败（已读到 ${loaded} 条）：${reason}`
+        },
+      },
+    )
 
-      tasks.push(...normalizeRecords(page.records, fieldIds))
-
-      const next = page.hasMore ? String(page.pageToken ?? '') : ''
-      pageToken = next && next !== pageToken ? next : undefined
-      pages += 1
-    } while (pageToken && pages < 200)
-
-    return tasks
+    return normalizeRecords(records, fieldIds)
   }
 
   /** 构建依赖图（纯逻辑见 graphBuilder） */
@@ -284,13 +304,22 @@ function normalizeRecords(
     projectIdId?: string
     listId?: string
     descriptionId?: string
-    dependencyFieldId: string
+    dependencyFieldIds: string[]
     parentFieldId?: string
   },
 ): BaseTask[] {
   const tasks: BaseTask[] = []
   for (const record of records) {
     const get = (fieldId?: string) => (fieldId ? record.fields[fieldId] : undefined)
+
+    const prerequisitesByField: Record<string, string[]> = {}
+    const merged: string[] = []
+    for (const fieldId of ids.dependencyFieldIds) {
+      const refs = cellToRecordIds(get(fieldId))
+      prerequisitesByField[fieldId] = refs
+      for (const ref of refs) if (!merged.includes(ref)) merged.push(ref)
+    }
+
     tasks.push({
       recordId: record.recordId,
       didaId: cellToText(get(ids.didaIdFieldId)) || undefined,
@@ -298,7 +327,8 @@ function normalizeRecords(
       status: cellToArray(get(ids.statusId)),
       tags: cellToArray(get(ids.tagsId)),
       dueDate: cellToDate(get(ids.dueId)),
-      prerequisites: cellToRecordIds(get(ids.dependencyFieldId)),
+      prerequisitesByField,
+      prerequisites: merged,
       parentRecordId: ids.parentFieldId
         ? cellToRecordIds(get(ids.parentFieldId))[0]
         : undefined,
@@ -312,5 +342,3 @@ function normalizeRecords(
   }
   return tasks
 }
-
-/** 记录页 → BaseTask[]（宿主与 mock 共用的归一化） */
