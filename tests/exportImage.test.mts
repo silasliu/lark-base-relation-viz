@@ -48,3 +48,9 @@ test('导出文件名带时间戳，不含非法字符', () => {
   assert.equal(name, '依赖图-20261029-1030.png')
   assert.doesNotMatch(name, /[:\\/*?"<>|]/)
 })
+
+test('导出文件名可带范围标签', () => {
+  const at = new Date(2026, 9, 29, 10, 30)
+  assert.equal(exportFileName(at, '全图'), '依赖图-全图-20261029-1030.png')
+  assert.equal(exportFileName(at, '当前视图'), '依赖图-当前视图-20261029-1030.png')
+})

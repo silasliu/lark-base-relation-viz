@@ -50,13 +50,14 @@ export function computeExportSize(
   }
 }
 
-/** 导出文件名：依赖图-20261029-1030.png */
-export function exportFileName(at: Date = new Date()): string {
+/** 导出文件名：依赖图-全图-20261029-1030.png（label 可选） */
+export function exportFileName(at: Date = new Date(), label?: string): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   const stamp =
     `${at.getFullYear()}${pad(at.getMonth() + 1)}${pad(at.getDate())}` +
     `-${pad(at.getHours())}${pad(at.getMinutes())}`
-  return `依赖图-${stamp}.png`
+  const middle = label ? `-${label}` : ''
+  return `依赖图${middle}-${stamp}.png`
 }
 
 function loadImage(dataUrl: string): Promise<HTMLImageElement> {

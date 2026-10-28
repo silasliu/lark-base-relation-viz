@@ -86,10 +86,11 @@ export function layoutConfig(mode: LayoutMode): Record<string, unknown> {
   // - controlPoints: true 让 dagre 预留边空间，减少交叉
   // - edgeLabelSpace: false 去掉无用的 dummy 节点（本图没有边标签）
   // - nodesep/ranksep 是节点边缘间的净空隙（不是中心距）
-  const dagreBase = { type: 'dagre', controlPoints: true, edgeLabelSpace: false, edgesep: 12 }
+  // - edgesep 拉大：让相邻的边之间留出空隙，线不贴着节点边框走
+  const dagreBase = { type: 'dagre', controlPoints: true, edgeLabelSpace: false, edgesep: 26 }
   switch (mode) {
     case 'dagre-lr':
-      return { ...dagreBase, rankdir: 'LR', nodesep: 20, ranksep: 64 }
+      return { ...dagreBase, rankdir: 'LR', nodesep: 30, ranksep: 46 }
     case 'force':
       // 用 force2：它的 collide 会对所有节点生效并推动重叠的节点分离；
       // gForce 在边长差异大的节点（132–240 宽）下收敛不稳定
@@ -135,7 +136,8 @@ export function layoutConfig(mode: LayoutMode): Record<string, unknown> {
     default:
       // BT = bottom-to-top：dagre 把 source 放在下方、target 放在上方。
       // 依赖边是「任务 → 前置」，于是任务在下、前置在上，符合「被依赖的排在上面」。
-      return { ...dagreBase, rankdir: 'BT', nodesep: 20, ranksep: 56 }
+      // ranksep 压小：卡片变大后纵向再留大空隙会显得散
+      return { ...dagreBase, rankdir: 'BT', nodesep: 30, ranksep: 34 }
   }
 }
 
@@ -231,6 +233,7 @@ export function separateOverlaps(graph: any, gap = 16): void {
             kind: 'title' | 'due' | 'tags'
             text?: string
             blockText?: string
+            blockKind?: 'block' | 'unlock'
             overdue?: boolean
             chips?: Array<{ text: string; x: number; width: number; overflow?: boolean; isList?: boolean }>
             fontSize: number
@@ -322,7 +325,8 @@ export function separateOverlaps(graph: any, gap = 16): void {
                   y,
                   text: line.blockText,
                   fontSize: R.dueFontSize,
-                  fill: COLOR.warning,
+                  // 未完成=橙（我挡着别人），已完成=绿（我放开了别人）
+                  fill: line.blockKind === 'unlock' ? COLOR.success : COLOR.warning,
                   textBaseline: 'middle',
                   cursor: 'pointer',
                 },
@@ -369,22 +373,30 @@ export function separateOverlaps(graph: any, gap = 16): void {
         const group = item.get('group')
         const box = group.find((s: any) => s.get('name') === 'box')
         if (!box) return
-        const selected = item.hasState('selected')
+        // 单选（React 驱动）与框选（G6 brush-select 驱动）用两个独立状态，
+        // 共用一个会被「选中某点后重设状态」的逻辑抹掉。
+        const chosen = item.hasState('selected') || item.hasState('brush')
 
         if (name === 'dim') {
-          // 压暗时保留选中节点的可见性
-          group.attr('opacity', value ? 0.12 : 1)
+          // 压暗但要保持可读：0.12 太狠，被选中的节点周围会像被抹掉一样。
+          // 被框选的节点不参与压暗。
+          group.attr('opacity', value && !chosen ? 0.45 : 1)
+        }
+        if (name === 'brush') {
+          group.attr('opacity', value ? 1 : item.hasState('dim') ? 0.45 : 1)
         }
 
-        // selected 优先级最高，其次 highlight，最后默认
-        if ((name === 'selected' || name === 'highlight') && !item.hasState('dim')) {
-          if (selected) {
+        // 选中（单选或框选）优先级最高，其次 highlight，最后默认
+        if (name === 'selected' || name === 'brush' || name === 'highlight' || name === 'dim') {
+          if (chosen) {
             box.attr({
               stroke: COLOR.primary,
               lineWidth: 2,
               shadowColor: 'rgba(51,112,255,0.25)',
               shadowBlur: 12,
             })
+          } else if (item.hasState('dim')) {
+            // 压暗的节点不抢边框，交给透明度表达
           } else if (item.hasState('highlight')) {
             box.attr({
               stroke: COLOR.highlightStroke,
@@ -489,14 +501,15 @@ export function separateOverlaps(graph: any, gap = 16): void {
           const dyAbs = Math.abs(dy)
           // 同层横向相邻：强制绕行，避免直线穿过节点
           if (dyAbs < 6) {
-            const midY = s.y + (dy >= 0 ? 28 : -28)
+            const midY = s.y + (dy >= 0 ? 36 : -36)
             return [
               { x: s.x, y: midY },
               { x: e.x, y: midY },
             ]
           }
-          // 跨层：控制点外伸不超过层距的 45%，远距离时保持近端垂直
-          const k = Math.min(0.45, 40 / dyAbs)
+          // 跨层：控制点外伸不超过层距的一半，远距离时保持近端垂直。
+          // 外伸多一点，曲线中段离两端节点更远，线不容易贴着卡片边缘走。
+          const k = Math.min(0.5, 56 / dyAbs)
           return [
             { x: s.x, y: s.y + dy * k },
             { x: e.x, y: e.y - dy * k },
@@ -505,13 +518,13 @@ export function separateOverlaps(graph: any, gap = 16): void {
 
         const dxAbs = Math.abs(dx)
         if (dxAbs < 6) {
-          const midX = s.x + (dx >= 0 ? 28 : -28)
+          const midX = s.x + (dx >= 0 ? 36 : -36)
           return [
             { x: midX, y: s.y },
             { x: midX, y: e.y },
           ]
         }
-        const k = Math.min(0.45, 40 / dxAbs)
+        const k = Math.min(0.5, 56 / dxAbs)
         return [
           { x: s.x + dx * k, y: s.y },
           { x: e.x - dx * k, y: e.y },
@@ -577,7 +590,8 @@ export function separateOverlaps(graph: any, gap = 16): void {
         if (!shape) return
 
         if (name === 'dim') {
-          group.attr('opacity', value ? 0.06 : 1)
+          // 边比节点更需要弱化，但也别弱化到看不见走向
+          group.attr('opacity', value ? 0.28 : 1)
         }
         if (name === 'highlight') {
           // 恢复时用关系自己的基准线宽，不要写字面量

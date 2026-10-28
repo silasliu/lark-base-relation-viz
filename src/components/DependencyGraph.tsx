@@ -15,6 +15,8 @@ interface DependencyGraphProps {
   onToggleCollapse?: (nodeId: string) => void
   collapsible?: (nodeId: string) => boolean
   onCanvasClick?: () => void
+  /** 双击空白处（用于收起侧栏） */
+  onCanvasDoubleClick?: () => void
   onZoomChange?: (zoom: number) => void
   /** 「整理」时先让上层清掉折叠状态，再由本组件重新布局 */
   onRequestArrange?: () => void
@@ -173,7 +175,7 @@ function syncGraphData(graph: Graph, data: GraphData, compact: boolean, vertical
 
 export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
   (
-    { data, layout, selectedId, onNodeClick, onNodeDoubleClick, onToggleCollapse, collapsible, onCanvasClick, onZoomChange, onRequestArrange, renderKey },
+    { data, layout, selectedId, onNodeClick, onNodeDoubleClick, onToggleCollapse, collapsible, onCanvasClick, onCanvasDoubleClick, onZoomChange, onRequestArrange, renderKey },
     ref,
   ) => {
     const containerRef = useRef<HTMLDivElement>(null)
@@ -188,6 +190,8 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
     collapsibleRef.current = collapsible
     const canvasClickRef = useRef(onCanvasClick)
     canvasClickRef.current = onCanvasClick
+    const canvasDblClickRef = useRef(onCanvasDoubleClick)
+    canvasDblClickRef.current = onCanvasDoubleClick
     const zoomRef = useRef(onZoomChange)
     zoomRef.current = onZoomChange
 
@@ -316,6 +320,19 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
           }
         })
       },
+      captureViewportImage() {
+        const graph = graphRef.current
+        if (!graph || graph.get('destroyed')) {
+          return Promise.reject(new Error('图还没准备好'))
+        }
+        try {
+          // toDataURL 只截当前可见区域，正是「导出当前视图」需要的
+          const url = graph.toDataURL('image/png', '#ffffff')
+          return url ? Promise.resolve(url) : Promise.reject(new Error('导出的图片为空'))
+        } catch (err) {
+          return Promise.reject(err instanceof Error ? err : new Error(String(err)))
+        }
+      },
     }))
 
     // ── 1. 建实例（仅挂载 / renderKey 变化时重建） ──
@@ -333,7 +350,9 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
         width: container.clientWidth || 1,
         height: container.clientHeight || 1,
         modes: {
-          // zoom-canvas 被移除：滚轮由 attachWheelZoom 接管
+          // zoom-canvas 被移除：滚轮由 attachWheelZoom 接管。
+          // 框选也没有用 G6 的 brush-select：它在 canvas:click 时会清空选择（源码里的 TODO），
+          // 所以这里是自己实现的（见下方「自定义框选」）。
           default: [{ type: 'drag-canvas', scalableRange: 0.3 }, 'drag-node'],
         },
         defaultNode: { type: 'task-node' },
@@ -346,9 +365,8 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
       })
 
       graphRef.current = graph
-      if (import.meta.env.DEV) {
-        ;(window as unknown as Record<string, unknown>).__depGraph = graph
-      }
+      // 始终暴露一份引用：便于在宿主控制台排查，也让自动化验收能读到真实节点坐标
+      ;(window as unknown as Record<string, unknown>).__depGraph = graph
 
       const detachWheel = attachWheelZoom(graph, container, () => {
         userZoomRef.current = true
@@ -390,7 +408,169 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
         if (collapsibleRef.current?.(id)) toggleRef.current?.(id)
       })
 
-      graph.on('canvas:click', () => canvasClickRef.current?.())
+      graph.on('canvas:click', () => {
+        // 点空白处取消框选
+        for (const n of graph.findAllByState('node', 'brush') as any[]) {
+          graph.setItemState(n, 'brush', false)
+        }
+        canvasClickRef.current?.()
+      })
+
+      /**
+       * 自定义框选。
+       *
+       * 为什么不用 G6 的 brush-select：它在 canvas:click 里会调用 clearStates（源码里自己留的 TODO），
+       * 框选刚结束就被清空。自己实现只多几十行，但行为完全可控。
+       *
+       * 用捕获阶段 + stopPropagation，让画布收不到这次拖动，也就不会同时平移。
+       */
+      const brushEl = document.createElement('div')
+      brushEl.className = 'brush-box'
+      brushEl.style.display = 'none'
+      container.appendChild(brushEl)
+
+      let brushing = false
+      let brushStart = { x: 0, y: 0 }
+
+      const localPoint = (e: MouseEvent) => {
+        const rect = container.getBoundingClientRect()
+        return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+      }
+
+      /** 起点落在节点上时不框选，交给节点拖动 */
+      const pointOnNode = (e: MouseEvent) => {
+        const p = graph.getPointByClient(e.clientX, e.clientY)
+        return graph.getNodes().some((n: any) => {
+          const b = n.getBBox()
+          return p.x >= b.minX && p.x <= b.maxX && p.y >= b.minY && p.y <= b.maxY
+        })
+      }
+
+      const onBrushDown = (e: MouseEvent) => {
+        if (!e.shiftKey || e.button !== 0) return
+        if (pointOnNode(e)) return
+        brushing = true
+        brushStart = localPoint(e)
+        brushEl.style.display = 'block'
+        brushEl.style.left = `${brushStart.x}px`
+        brushEl.style.top = `${brushStart.y}px`
+        brushEl.style.width = '0px'
+        brushEl.style.height = '0px'
+        e.preventDefault()
+        e.stopPropagation()
+      }
+
+      const onBrushMove = (e: MouseEvent) => {
+        if (!brushing) return
+        const p = localPoint(e)
+        brushEl.style.left = `${Math.min(brushStart.x, p.x)}px`
+        brushEl.style.top = `${Math.min(brushStart.y, p.y)}px`
+        brushEl.style.width = `${Math.abs(p.x - brushStart.x)}px`
+        brushEl.style.height = `${Math.abs(p.y - brushStart.y)}px`
+        e.preventDefault()
+        e.stopPropagation()
+      }
+
+      const onBrushUp = (e: MouseEvent) => {
+        if (!brushing) return
+        brushing = false
+        brushEl.style.display = 'none'
+        e.preventDefault()
+        e.stopPropagation()
+
+        const rect = container.getBoundingClientRect()
+        const end = localPoint(e)
+        // 几乎没移动就当成一次普通点击，不改变框选
+        if (Math.abs(end.x - brushStart.x) < 6 && Math.abs(end.y - brushStart.y) < 6) return
+
+        const a = graph.getPointByClient(
+          rect.left + Math.min(brushStart.x, end.x),
+          rect.top + Math.min(brushStart.y, end.y),
+        )
+        const b = graph.getPointByClient(
+          rect.left + Math.max(brushStart.x, end.x),
+          rect.top + Math.max(brushStart.y, end.y),
+        )
+
+        for (const n of graph.findAllByState('node', 'brush') as any[]) {
+          graph.setItemState(n, 'brush', false)
+        }
+        const picked = graph.getNodes().filter((n: any) => {
+          const bb = n.getBBox()
+          return !(bb.maxX < a.x || bb.minX > b.x || bb.maxY < a.y || bb.minY > b.y)
+        })
+        for (const n of picked) graph.setItemState(n, 'brush', true)
+      }
+
+      container.addEventListener('mousedown', onBrushDown, true)
+      container.addEventListener('mousemove', onBrushMove, true)
+      container.addEventListener('mouseup', onBrushUp, true)
+
+      // 双击空白：收起侧栏。点在节点上不触发（node:dblclick 已经处理）
+      graph.on('canvas:dblclick', (evt: any) => {
+        if (evt?.item) return
+        canvasDblClickRef.current?.()
+      })
+
+      /**
+       * 框选后整组拖动。
+       *
+       * G6 v4 的 drag-node 只移动被按住的那一个节点。框选多个之后用户期待整组一起动，
+       * 所以这里记住按下时各节点的坐标，按主节点的位移同步其余选中节点。
+       */
+      let multiDrag: {
+        leadId: string
+        leadX: number
+        leadY: number
+        others: Array<{ id: string; x: number; y: number }>
+      } | null = null
+
+      graph.on('node:dragstart', (evt: any) => {
+        const item = evt?.item
+        if (!item) return
+        const id = item.getModel().id
+        // 框选和单选是两种状态，整组拖动时两种都要带上
+        const pool = [
+          ...(graph.findAllByState('node', 'brush') as any[]),
+          ...(graph.findAllByState('node', 'selected') as any[]),
+        ]
+        const seen = new Set<string>()
+        const chosen = pool.filter((n) => {
+          const nid = n.getModel().id
+          if (seen.has(nid)) return false
+          seen.add(nid)
+          return true
+        })
+        if (chosen.length <= 1 || !chosen.some((n) => n.getModel().id === id)) {
+          multiDrag = null
+          return
+        }
+        const model = item.getModel()
+        multiDrag = {
+          leadId: id,
+          leadX: model.x,
+          leadY: model.y,
+          others: chosen
+            .filter((n) => n.getModel().id !== id)
+            .map((n) => ({ id: n.getModel().id, x: n.getModel().x, y: n.getModel().y })),
+        }
+      })
+
+      graph.on('node:drag', (evt: any) => {
+        if (!multiDrag) return
+        const model = evt?.item?.getModel()
+        if (!model || model.id !== multiDrag.leadId) return
+        const dx = model.x - multiDrag.leadX
+        const dy = model.y - multiDrag.leadY
+        for (const other of multiDrag.others) {
+          graph.updateItem(other.id, { x: other.x + dx, y: other.y + dy }, false)
+        }
+        graph.paint()
+      })
+
+      graph.on('node:dragend', () => {
+        multiDrag = null
+      })
 
       graph.on('viewportchange', () => {
         zoomReporterRef.current?.report(graph.getZoom())
@@ -429,6 +609,10 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
 
       return () => {
         detachWheel()
+        container.removeEventListener('mousedown', onBrushDown, true)
+        container.removeEventListener('mousemove', onBrushMove, true)
+        container.removeEventListener('mouseup', onBrushUp, true)
+        brushEl.remove()
         if (clickTimer) window.clearTimeout(clickTimer)
         if (resizeTimer) window.clearTimeout(resizeTimer)
         if (fitTimerRef.current) {
@@ -486,6 +670,13 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
         didFitRef.current = true
         // 交给防抖：同一批数据可能触发多次布局
         scheduleFit(80)
+        // 再补一次「落定后适配」：某些宿主里布局的最终坐标比 afterlayout 稍晚一点，
+        // 只适配一次会停在半成品位置，看起来就是图被裁掉。用户手动缩放过就不再干预。
+        window.setTimeout(() => {
+          if (userZoomRef.current) return
+          if (graph.get('destroyed')) return
+          runFit()
+        }, 420)
       }
 
       if (!didFitRef.current) {
@@ -604,6 +795,9 @@ export const DependencyGraph = forwardRef<GraphApi, DependencyGraphProps>(
           >
             整理
           </button>
+          <div className="graph-ctrl-hint" title="按住 Shift 拖动可框选多个节点，框选后可整组拖动">
+            Shift 框选
+          </div>
         </div>
       </div>
     )

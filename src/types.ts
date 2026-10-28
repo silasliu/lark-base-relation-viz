@@ -190,4 +190,6 @@ export interface GraphApi {
   arrange(): void;
   /** 导出整图为 PNG dataURL（不受当前视口限制） */
   captureFullImage(): Promise<string>;
+  /** 导出当前视口可见范围为 PNG dataURL */
+  captureViewportImage(): Promise<string>;
 }

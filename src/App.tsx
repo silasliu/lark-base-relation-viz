@@ -18,12 +18,6 @@ import { LAYOUT_LABELS } from './components/graphShapes'
 import { WHEEL_ZOOM_MIN } from './components/graphZoom'
 import { resolveRelationStyles, lineDashCss } from './services/relationStyles'
 import { downloadPng, exportFileName } from './services/exportImage'
-import {
-  requestFullscreen,
-  exitFullscreen,
-  isFullscreen,
-  onFullscreenChange,
-} from './services/fullscreen'
 import { config } from './config'
 import './App.css'
 
@@ -66,13 +60,24 @@ function App() {
   const [filter, setFilter] = useState<ChecklistFilter>({})
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [exporting, setExporting] = useState(false)
-  /** iframe 内沉浸模式（宿主不允许真全屏时的兜底） */
+  const [exportMenu, setExportMenu] = useState(false)
+  /** 沉浸模式：隐藏工具栏与侧栏，把插件可用区域全部给画布 */
   const [immersive, setImmersive] = useState(false)
-  const [nativeFull, setNativeFull] = useState(false)
 
   const [collapse, setCollapse] = useState<CollapseState>(EMPTY_COLLAPSE)
   const [liveTick, setLiveTick] = useState(0)
   const [liveOn, setLiveOn] = useState(true)
+
+  // 点空白处关闭导出菜单
+  useEffect(() => {
+    if (!exportMenu) return
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null
+      if (!target?.closest('.export-wrap')) setExportMenu(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [exportMenu])
 
   const service = useMemo(() => new BaseDataService(), [])
   const configRef = useRef<PersistedConfig | null>(null)
@@ -358,8 +363,9 @@ function App() {
   }, [])
 
   const handleLocate = useCallback((node: GraphNode) => {
+    // 在清单里点任务只是「在图里定位它」，不要把人拽到详情页，
+    // 否则想连着看几条就要来回切标签。
     setSelectedNode(node)
-    setSideTab('details')
     graphApiRef.current?.focus(node.id)
   }, [])
 
@@ -368,47 +374,37 @@ function App() {
     setCollapse(EMPTY_COLLAPSE)
   }, [])
 
-  // ── 导出图片 ──
-  const handleExport = useCallback(async () => {
-    if (!graphData || exporting) return
-    setExporting(true)
-    try {
-      const dataUrl = await graphApiRef.current?.captureFullImage()
-      if (!dataUrl) throw new Error('图还没准备好')
-      const size = await downloadPng(dataUrl, exportFileName())
-      showToast(
-        size.scaled
-          ? `已导出 ${size.width}×${size.height}（原图过大，已等比压缩）`
-          : `已导出 ${size.width}×${size.height}`,
-      )
-    } catch (err) {
-      showToast(`导出失败：${err instanceof Error ? err.message : String(err)}`)
-    } finally {
-      setExporting(false)
-    }
-  }, [graphData, exporting, showToast])
+  // ── 导出图片：整图 / 当前视图 ──
+  const handleExport = useCallback(
+    async (mode: 'full' | 'viewport') => {
+      if (!graphData || exporting) return
+      setExporting(true)
+      const label = mode === 'full' ? '全图' : '当前视图'
+      try {
+        const dataUrl =
+          mode === 'full'
+            ? await graphApiRef.current?.captureFullImage()
+            : await graphApiRef.current?.captureViewportImage()
+        if (!dataUrl) throw new Error('图还没准备好')
+        const size = await downloadPng(dataUrl, exportFileName(new Date(), label))
+        showToast(
+          size.scaled
+            ? `已导出${label} ${size.width}×${size.height}（原图过大，已等比压缩）`
+            : `已导出${label} ${size.width}×${size.height}`,
+        )
+      } catch (err) {
+        showToast(`导出失败：${err instanceof Error ? err.message : String(err)}`)
+      } finally {
+        setExporting(false)
+      }
+    },
+    [graphData, exporting, showToast],
+  )
 
-  // ── 全屏 / 沉浸模式 ──
-  useEffect(() => {
-    const off = onFullscreenChange(() => setNativeFull(isFullscreen()))
-    return off
+  // ── 全屏：只把插件自己的可用区域铺满，不开新窗口、不切标签页 ──
+  const toggleImmersive = useCallback(() => {
+    setImmersive((v) => !v)
   }, [])
-
-  const toggleFullscreen = useCallback(async () => {
-    if (nativeFull) {
-      await exitFullscreen()
-      return
-    }
-    if (immersive) {
-      setImmersive(false)
-      return
-    }
-    const el = appRef.current
-    if (el && (await requestFullscreen(el))) return
-    // 宿主 iframe 没给 allowfullscreen 时走这里：至少把可用区域用满
-    setImmersive(true)
-    showToast('当前环境不允许真全屏，已切换为沉浸模式（按 Esc 退出）')
-  }, [nativeFull, immersive, showToast])
 
   useEffect(() => {
     if (!immersive) return
@@ -462,10 +458,9 @@ function App() {
   const displayData = viewData?.data ?? graphData
   const collapsedCount = collapse.parents.size + collapse.deps.size
   const extraDepFields = fields.filter((f) => f.id !== primaryDepFieldId)
-  const isImmersive = immersive || nativeFull
 
   return (
-    <div className={`app-container ${isImmersive ? 'immersive' : ''}`} ref={appRef}>
+    <div className={`app-container ${immersive ? 'immersive' : ''}`} ref={appRef}>
       {/* ── 工具栏：主行 + 设置抽屉 ── */}
       <div className="toolbar">
         <label className="toolbar-item">
@@ -487,24 +482,50 @@ function App() {
           {analyzing ? '分析中…' : '刷新'}
         </button>
 
-        <button
-          className="icon-button text"
-          onClick={handleExport}
-          disabled={!graphData || exporting}
-          title="导出整张图为 PNG（不受当前视口限制）"
-          aria-label="导出图片"
-        >
-          {exporting ? '导出中…' : '导出'}
-        </button>
+        <div className="export-wrap">
+          <button
+            className={`icon-button text ${exportMenu ? 'active' : ''}`}
+            onClick={() => setExportMenu((v) => !v)}
+            disabled={!graphData || exporting}
+            title="导出为 PNG"
+            aria-label="导出图片"
+          >
+            {exporting ? '导出中…' : '导出'}
+          </button>
+          {exportMenu && (
+            <div className="export-menu" role="menu">
+              <button
+                role="menuitem"
+                onClick={() => {
+                  setExportMenu(false)
+                  void handleExport('full')
+                }}
+              >
+                导出全图
+                <span className="export-menu-hint">整张图，不受视口限制</span>
+              </button>
+              <button
+                role="menuitem"
+                onClick={() => {
+                  setExportMenu(false)
+                  void handleExport('viewport')
+                }}
+              >
+                导出当前视图
+                <span className="export-menu-hint">只截现在看得到的部分</span>
+              </button>
+            </div>
+          )}
+        </div>
 
         <button
-          className={`icon-button text ${isImmersive ? 'active' : ''}`}
-          onClick={toggleFullscreen}
+          className={`icon-button text ${immersive ? 'active' : ''}`}
+          onClick={toggleImmersive}
           disabled={!graphData}
-          title="全屏（宿主不允许时降级为沉浸模式，Esc 退出）"
+          title="全屏：把插件区域铺满，不打开新窗口；Esc 退出"
           aria-label="全屏"
         >
-          {isImmersive ? '退出' : '全屏'}
+          {immersive ? '退出' : '全屏'}
         </button>
 
         <button
@@ -669,6 +690,7 @@ function App() {
                 return k.parent || k.dep
               }}
               onCanvasClick={() => setSelectedNode(null)}
+              onCanvasDoubleClick={() => setSidebarCollapsed(true)}
               onZoomChange={setZoom}
               onRequestArrange={handleRequestArrange}
               renderKey={`${tableId}|${depFieldIds.join(',')}|${parentFieldId}|${showParent}|${depRole}|${parentRole}`}
@@ -818,13 +840,10 @@ function App() {
         )
       )}
 
-      {isImmersive && (
+      {immersive && (
         <button
           className="immersive-exit"
-          onClick={() => {
-            if (nativeFull) void exitFullscreen()
-            setImmersive(false)
-          }}
+          onClick={() => setImmersive(false)}
           title="退出全屏（Esc）"
         >
           退出全屏

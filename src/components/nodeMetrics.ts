@@ -1,17 +1,17 @@
 import type { GraphNode, GraphData } from '../types'
 
 export const NODE_METRICS = {
-  fontSize: 12,
-  dueFontSize: 11,
-  tagFontSize: 10,
-  lineHeight: 18,
-  paddingX: 14,
-  paddingY: 13,
+  fontSize: 13,
+  dueFontSize: 11.5,
+  tagFontSize: 11,
+  lineHeight: 20,
+  paddingX: 16,
+  paddingY: 14,
   accentBarW: 3,
   /** 文本区最大宽度（不含内边距与色条） */
-  maxTextWidth: 200,
-  minWidth: 132,
-  maxWidth: 240,
+  maxTextWidth: 236,
+  minWidth: 152,
+  maxWidth: 288,
 }
 
 export type NodeMetrics = typeof NODE_METRICS
@@ -22,12 +22,12 @@ export type NodeMetrics = typeof NODE_METRICS
  */
 export const NODE_METRICS_COMPACT: NodeMetrics = {
   ...NODE_METRICS,
-  paddingX: 9,
-  paddingY: 9,
-  lineHeight: 16,
-  maxTextWidth: 132,
-  minWidth: 100,
-  maxWidth: 168,
+  paddingX: 10,
+  paddingY: 10,
+  lineHeight: 17,
+  maxTextWidth: 156,
+  minWidth: 116,
+  maxWidth: 200,
 }
 
 export function nodeMetricsFor(compact: boolean): NodeMetrics {
@@ -36,15 +36,15 @@ export function nodeMetricsFor(compact: boolean): NodeMetrics {
 
 /** 标签 chip 参数 */
 export const TAG_CHIP = {
-  fontSize: 10,
-  padX: 4,
+  fontSize: 11,
+  padX: 5,
   gap: 4,
   radius: 3,
-  height: 15,
+  height: 17,
   /** 最多显示的完整标签数，其余折叠为 +N */
   maxCount: 2,
   /** 单个标签最大文字宽 */
-  maxSingleWidth: 76,
+  maxSingleWidth: 86,
 } as const
 
 /** 按字符估算文本宽度：CJK / emoji 约等于字号，拉丁字符约 0.55 字号 */
@@ -91,11 +91,23 @@ function dueText(node: GraphNode): string {
   return node.overdueDays ? `📅 ${d} 逾期${node.overdueDays}天` : `📅 ${d}`
 }
 
-/** 阻塞徽标文案：表示本任务卡住了多少个下游未完成任务（关键性） */
-function blockText(node: GraphNode): string {
-  if (!node.isIncomplete) return ''
-  if (node.blocksCount > 0) return `阻塞：${node.blocksCount}`
-  return ''
+/** 关系徽标的两种语义 */
+export type BadgeKind = 'block' | 'unlock'
+
+/**
+ * 关系徽标。
+ *
+ * - 未完成：`阻塞：N` —— 我卡住了多少个下游未完成任务
+ * - 已完成：`解锁：N` —— 我完成后放开了多少个下游任务
+ *
+ * 同一个数字，站在不同的时间点看是两种意思，所以文案必须跟着状态变，
+ * 否则完成的任务还写「阻塞」会让人以为它还在挡路。
+ */
+export function badgeOf(node: GraphNode): { text: string; kind: BadgeKind } | null {
+  if (node.blocksCount <= 0) return null
+  return node.isIncomplete
+    ? { text: `阻塞：${node.blocksCount}`, kind: 'block' }
+    : { text: `解锁：${node.blocksCount}`, kind: 'unlock' }
 }
 
 /**
@@ -141,6 +153,8 @@ export interface DisplayLine {
   text?: string
   overdue?: boolean
   blockText?: string
+  /** 徽标语义：阻塞（未完成）/ 解锁（已完成） */
+  blockKind?: BadgeKind
   chips?: TagChip[]
   fontSize: number
   width: number
@@ -151,12 +165,15 @@ function measureLines(node: GraphNode): {
   titleRaw: string
   due: string
   block: string
+  blockKind?: BadgeKind
   hasTags: boolean
 } {
+  const badge = badgeOf(node)
   return {
     titleRaw: `${node.emoji} ${node.title}`,
     due: dueText(node),
-    block: blockText(node),
+    block: badge?.text ?? '',
+    blockKind: badge?.kind,
     hasTags: Boolean(node.listName) || node.tags.length > 0,
   }
 }
@@ -219,7 +236,7 @@ export function nodeDisplayLines(
   const R = metrics
   const [width, height] = measureNode(node, metrics)
   const contentWidth = width - R.accentBarW - R.paddingX * 2
-  const { titleRaw, due, block, hasTags } = measureLines(node)
+  const { titleRaw, due, block, blockKind, hasTags } = measureLines(node)
 
   const lines: DisplayLine[] = []
 
@@ -246,6 +263,7 @@ export function nodeDisplayLines(
       kind: 'due',
       text: dueShown || undefined,
       blockText: blockShown || undefined,
+      blockKind: blockShown ? blockKind : undefined,
       overdue: Boolean(node.overdueDays) && Boolean(dueShown),
       fontSize: R.dueFontSize,
       width: totalW,

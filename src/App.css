@@ -1339,3 +1339,74 @@
   border-color: #3370ff;
   color: #3370ff;
 }
+
+/* ══════════ 导出菜单 ══════════ */
+.export-wrap {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.export-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 196px;
+  padding: 6px;
+  background: #fff;
+  border: 1px solid #dee0e3;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(31, 35, 41, 0.14);
+}
+
+.export-menu button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #1f2329;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.export-menu button:hover {
+  background: #f2f3f5;
+}
+
+.export-menu-hint {
+  font-size: 10px;
+  color: #8f959e;
+}
+
+/* 框选提示：不抢眼，但让人知道有这功能 */
+.graph-ctrl-hint {
+  padding: 3px 6px;
+  font-size: 10px;
+  color: #8f959e;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #e5e6eb;
+  border-radius: 6px;
+  text-align: center;
+  user-select: none;
+}
+
+/* 框选矩形：画在画布之上，不吃鼠标事件 */
+.brush-box {
+  position: absolute;
+  z-index: 3;
+  border: 1px dashed #3370ff;
+  background: rgba(51, 112, 255, 0.08);
+  border-radius: 2px;
+  pointer-events: none;
+}

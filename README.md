@@ -7,16 +7,17 @@ A read-only view of task dependencies and parent-child relations in a Feishu Bas
 ## What it does
 
 - **Views** — dagre TB (default) / dagre LR / force / circular / radial.
-- **Nodes** — title, due date (red when overdue), blocking badge (`阻塞：N`, where N is the number of downstream unfinished tasks this task blocks **transitively**), **list** (blue chip) + tag chips (max 2 + `+N`); left bar red = incomplete, gray-green = done.
+- **Nodes** — title, due date (red when overdue), relation badge (**`阻塞：N`** while unfinished, **`解锁：N`** once done — same count, two meanings), **list** (blue chip) + tag chips (max 2 + `+N`); left bar red = incomplete, gray-green = done.
 - **Dependency edges** — **task → prerequisite**, the arrow points at what it is waiting for. Prerequisites are laid out **above** tasks, and anchors are picked dynamically from the two nodes' actual positions. Three states: red = prerequisite unfinished (blocking), green = prerequisite done (clear to start), gray = this task is done (relation no longer actionable).
 - **Several relations at once** — tick more link fields under 更多 → 同时显示. Colour always means *state*; relation identity is carried by **line style + arrow shape + width** (solid + filled triangle, dashed + open arrow, dotted + diamond). The legend lists exactly the relations present in the current graph.
 - **Parent-child edges** — parent → child, gray dashed, no arrow. **Can be turned off** in settings; when off, tasks that only have parent links no longer appear.
-- **Checklist** — ready / blocked / done / all, searchable by list and tag; click to focus the node.
+- **Checklist** — ready / blocked / done / all, searchable by list and tag. Clicking an item **focuses the node in the graph but stays on the checklist**, so you can walk through several tasks without tab-hopping.
 - **Details** — task body (description), clickable prerequisites/successors/parent/children, clickable list and tags (click to filter), web link and client link.
-- **Interaction** — click to select & highlight neighbours, double-click to open TickTick, right-click to collapse/expand, wheel zoom proportional to physical distance.
+- **Interaction** — click to select & highlight neighbours (the rest fade to 45%, still readable), double-click a node to open TickTick, right-click to collapse/expand, wheel zoom proportional to physical distance, **double-click empty space to collapse the sidebar**.
+- **Box select** — hold **Shift** and drag on empty canvas to lasso several nodes, then drag any one of them to move the whole group. Shift is used so plain drag still pans the canvas.
 - **显示全部 vs 整理** — *显示全部* only re-fits the current graph into the viewport (layout untouched). *整理* expands every collapsed node, re-runs the layout, separates overlaps, then fits — it is the "put this back in order" button.
-- **导出** — renders the **whole** graph (not just the visible area) to a PNG on a white background, capped at 4096px on the longest edge with proportional downscale, filename stamped with date and time.
-- **全屏** — tries the real Fullscreen API first; when the host iframe does not allow it, it falls back to an in-iframe immersive mode (toolbar and sidebar hidden, `Esc` to leave) so the button never does nothing.
+- **导出** — two modes: **导出全图** renders the whole graph (not just the visible area); **导出当前视图** captures exactly what is on screen. Both are white-backed PNGs, capped at 4096px on the longest edge with proportional downscale, filename stamped with date and time.
+- **全屏** — fills the plugin's own area only (toolbar and sidebar hidden, `Esc` to leave). It does **not** open a new window or tab, and does not rely on the browser Fullscreen API, which a Feishu iframe may refuse.
 - **Sidebar** — collapsible; on narrow screens (Feishu side panel) it moves to the bottom, collapsed as a single row and expanded to the lower half, without covering the canvas.
 
 ## Reading large tables
@@ -118,14 +119,13 @@ feishu-plugins/dependency-graph/
 ├── src/
 │   ├── config.ts                  # optional fields + TickTick search scheme
 │   ├── types.ts                   # data structures (incl. direction semantics, relation ids)
-│   ├── App.tsx                    # toolbar / settings bar / sidebar / export / fullscreen
+│   ├── App.tsx                    # toolbar / settings bar / sidebar / export / immersive
 │   ├── services/
 │   │   ├── BaseDataService.ts     # SDK reads (with mock fallback), cell normalization
 │   │   ├── pagination.ts          # pure page reader (no SDK) — unit tested
 │   │   ├── relationStyles.ts      # relation -> line style/arrow registry — unit tested
 │   │   ├── configSchema.ts        # config v1 -> v2 migration — unit tested
 │   │   ├── exportImage.ts         # PNG sizing/download — sizing is unit tested
-│   │   ├── fullscreen.ts          # Fullscreen API with graceful rejection
 │   │   ├── ConfigStore.ts         # bridge persistence around configSchema
 │   │   └── graphBuilder.ts        # pure logic: tasks -> graph + checklist
 │   └── components/
@@ -167,6 +167,11 @@ npm run build        # output in dist/
    line style from `relationStyles.ts` so no drawing code changes.
 9. **Node ids carry a table namespace** (`tableId:recordId`) when a namespace is supplied, so two tables
    with colliding record ids cannot overwrite each other. Single-table ids stay plain `recordId`.
+10. **Box selection is hand-rolled.** G6's `brush-select` clears its own selection on `canvas:click`
+    (a TODO in its source), so the brush is implemented with a capture-phase listener that stops
+    propagation — which also keeps the canvas from panning at the same time.
+11. **Single selection and box selection use different states** (`selected` vs `brush`). Sharing one
+    state means any React re-render wipes the lassoed set.
 
 ## Known limitations
 
@@ -179,8 +184,9 @@ npm run build        # output in dist/
    small residue on very large graphs.
 7. **Multi-table display is not exposed yet.** The data model is ready (namespaced node ids, per-edge
    `relationId`, config v2), but the UI still selects one table at a time.
-8. **Fullscreen depends on the host.** Feishu's iframe may not carry `allowfullscreen`; in that case the
-   immersive fallback is what you get, and it only fills the iframe, not the screen.
+8. **Fullscreen means the plugin area, not the screen.** The browser Fullscreen API is deliberately not
+   used (it can open a separate window / tab and a Feishu iframe may refuse it anyway), so the button
+   fills the iframe only.
 9. **Export has a size ceiling.** Above 4096px on the longest edge the image is downscaled; very large
    graphs are still capped by browser canvas area limits.
 10. Reading is serial, one page at a time — correct, but a very large table takes several round trips.
