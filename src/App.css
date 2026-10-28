@@ -1410,3 +1410,28 @@
   border-radius: 2px;
   pointer-events: none;
 }
+
+/* ══════════ 出错时的自诊断 ══════════ */
+.diag {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #646a73;
+  white-space: normal;
+}
+
+.diag summary {
+  width: fit-content;
+  cursor: pointer;
+  user-select: none;
+  color: #d83931;
+}
+
+.diag-body {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #f0d9d9;
+  border-radius: 8px;
+  line-height: 1.8;
+  word-break: break-all;
+}

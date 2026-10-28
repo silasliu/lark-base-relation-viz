@@ -49,16 +49,23 @@ function probablyInHost(): boolean {
 const PAGE_SIZE = 200
 
 /** SDK 在非宿主环境下可能永不 resolve，必须自己设超时兜底 */
-const HOST_TIMEOUT_MS = 15_000
+const HOST_TIMEOUT_MS = 20_000
 
 const HOST_TIMEOUT_MESSAGE =
   '连接多维表格宿主超时。这个页面需要作为「多维表格扩展程序」在飞书里打开，直接用浏览器访问是读不到表的。'
 
-function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+/** 探测 SDK 是否可用时的超时：短一点，避免把「请在飞书里打开」的提示拖住 */
+const PROBE_TIMEOUT_MS = 2_500
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  message: string,
+  ms: number = HOST_TIMEOUT_MS,
+): Promise<T> {
   return Promise.race([
     promise,
     new Promise<T>((_, reject) => {
-      setTimeout(() => reject(new Error(message)), HOST_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(message)), ms)
     }),
   ])
 }
@@ -145,30 +152,104 @@ export interface LoadProgress {
   onProgress?: (loaded: number, total?: number) => void
 }
 
+/** 关联字段扫描结果（含跨表字段，用于诊断） */
+export interface ScannedLinkField {
+  id: string
+  name: string
+  targetTableId: string
+  /** 是否指向本表（只有自关联才能画图） */
+  selfLink: boolean
+}
+
 /**
  * 读取多维表格并构建依赖图。
  * 插件运行在飞书宿主中，鉴权由宿主提供，无需 token。
  */
 export class BaseDataService {
-  /** 是否运行在模拟数据模式（浏览器直开调试） */
-  readonly isMock = !probablyInHost()
+  /**
+   * 运行环境：宿主 / 本地 mock。
+   * 不用「是不是 iframe」当唯一依据——有些宿主会把插件开在独立窗口里，
+   * 那样 window.parent === window，但 SDK 其实是可用的。
+   */
+  private mode: 'unknown' | 'host' | 'mock' = 'unknown'
+
+  /** 是否处于本地 mock 模式（判定完成后才有意义） */
+  get isMock(): boolean {
+    return this.mode === 'mock'
+  }
+
+  /**
+   * 判定一次并缓存。
+   *
+   * 先用「是不是 iframe」快速判断，不做任何桥接等待——否则每次启动都要先等一次
+   * SDK 超时，浏览器里调试会卡十几秒。只有「判成 mock 但本地没有 mock 数据」时
+   * 才回头探一次真实 SDK（有些宿主会把插件开在独立窗口里，此时
+   * window.parent === window，但 SDK 其实可用）。
+   */
+  private async ensureMode(): Promise<'host' | 'mock'> {
+    if (this.mode !== 'unknown') return this.mode
+    this.mode = probablyInHost() ? 'host' : 'mock'
+    return this.mode
+  }
+
+  /** 探一次真实 SDK，用来纠正「独立窗口里其实是宿主」的情况 */
+  private async probeHost(): Promise<boolean> {
+    try {
+      await withTimeout(
+        bitable.base.getTableMetaList(),
+        HOST_TIMEOUT_MESSAGE,
+        PROBE_TIMEOUT_MS,
+      )
+      this.mode = 'host'
+      return true
+    } catch {
+      return false
+    }
+  }
 
   /** 当前 Base 里的所有数据表 */
   async listTables(): Promise<TableOption[]> {
-    if (this.isMock) {
-      const mock = await loadMock()
-      return mock._tables ?? []
+    if ((await this.ensureMode()) === 'mock') {
+      try {
+        const mock = await loadMock()
+        return mock._tables ?? []
+      } catch (mockError) {
+        // 拿不到本地 mock：可能其实在宿主里，只是宿主开的是独立窗口
+        if (await this.probeHost()) {
+          const metas = await withTimeout(bitable.base.getTableMetaList(), HOST_TIMEOUT_MESSAGE)
+          return metas.map((m) => ({ id: m.id, name: m.name }))
+        }
+        throw mockError
+      }
     }
     const metas = await withTimeout(bitable.base.getTableMetaList(), HOST_TIMEOUT_MESSAGE)
     return metas.map((m) => ({ id: m.id, name: m.name }))
   }
 
   /**
-   * 某张表里的自关联字段（可作为依赖或父子来源）。
-   * 只有「关联到本表自己」的字段才有图上的语义，跨表关联不参与。
+   * 当前在 Base 界面里正打开的那张表。
+   *
+   * 为什么需要它：以前是盲选「第一张表」，但用户实际看的是 URL 里那张
+   * （`?table=tblXXXX`）。多表 Base 里这会让插件打开错误的表，
+   * 表现为「什么都显示不出来」。
    */
-  async listLinkFields(tableId: string): Promise<LinkFieldOption[]> {
-    if (this.isMock) {
+  async getActiveTableId(): Promise<string | undefined> {
+    if ((await this.ensureMode()) === 'mock') return undefined
+    try {
+      const table = await withTimeout(bitable.base.getActiveTable(), HOST_TIMEOUT_MESSAGE)
+      return table?.id || undefined
+    } catch {
+      // 拿不到就退回「已保存 / 第一张表」，不阻断
+      return undefined
+    }
+  }
+
+  /**
+   * 扫描一张表里所有关联字段（含跨表），用于诊断。
+   * 只有 `selfLink = true`（指向本表）的字段能画图。
+   */
+  async scanLinkFields(tableId: string): Promise<ScannedLinkField[]> {
+    if ((await this.ensureMode()) === 'mock') {
       const mock = await loadMock()
       const metas = mock._fieldMeta ?? []
       // 不写死字段名：扫一遍记录，凡是「值为 record 引用数组」的字段都算关联字段。
@@ -182,20 +263,36 @@ export class BaseDataService {
       }
       return metas
         .filter((m) => linkIds.has(m.id))
-        .map((m) => ({ id: m.id, name: m.name, targetTableId: tableId }))
+        .map((m) => ({ id: m.id, name: m.name, targetTableId: tableId, selfLink: true }))
     }
+
     const table = await withTimeout(bitable.base.getTableById(tableId), HOST_TIMEOUT_MESSAGE)
     const metas = await withTimeout(table.getFieldMetaList(), HOST_TIMEOUT_MESSAGE)
 
-    const result: LinkFieldOption[] = []
+    const result: ScannedLinkField[] = []
     for (const meta of metas) {
       if (meta.type !== FieldType.SingleLink && meta.type !== FieldType.DuplexLink) continue
       const property = (meta as { property?: { tableId?: string } }).property
-      const targetTableId = property?.tableId ?? ''
-      if (targetTableId !== tableId) continue
-      result.push({ id: meta.id, name: meta.name, targetTableId })
+      const targetTableId = String(property?.tableId ?? '')
+      result.push({
+        id: meta.id,
+        name: meta.name,
+        targetTableId,
+        selfLink: targetTableId === tableId,
+      })
     }
     return result
+  }
+
+  /**
+   * 某张表里的自关联字段（可作为依赖或父子来源）。
+   * 只有「关联到本表自己」的字段才有图上的语义，跨表关联不参与。
+   */
+  async listLinkFields(tableId: string): Promise<LinkFieldOption[]> {
+    const all = await this.scanLinkFields(tableId)
+    return all
+      .filter((f) => f.selfLink)
+      .map((f) => ({ id: f.id, name: f.name, targetTableId: f.targetTableId }))
   }
 
   /**
@@ -213,7 +310,7 @@ export class BaseDataService {
     const depFieldIds = dependencyFieldIds.filter(Boolean)
 
     // 浏览器直开 → mock 快照（走与宿主完全相同的归一化路径，字段元数据从 _fieldMeta 取）
-    if (this.isMock) {
+    if ((await this.ensureMode()) === 'mock') {
       const mock = await loadMock()
       const metas = mock._fieldMeta ?? []
       const idByName = new Map(metas.map((m) => [m.name, m.id]))

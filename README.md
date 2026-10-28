@@ -55,7 +55,15 @@ the layout settled cannot leave the graph cropped.
 2. Add capability → **Base extension** → table view.
 3. Put the assigned `blockTypeID` into `block.json`.
 
-### 2. Configure fields
+### 2. Which table it reads
+
+The plugin opens the table **you are currently looking at** in the Base UI (`?table=` in the URL).
+Falling back in order: active table → last saved choice → first table.
+
+This matters on multi-table bases: picking "the first table" blindly used to open a table with no
+self-referencing link field, which looks exactly like "the plugin shows nothing".
+
+### 3. Configure fields
 
 Field names are **not hardcoded**. On open the plugin lists every self-referencing link field in the
 current table and lets you choose.
@@ -65,7 +73,7 @@ other way (it stores "my successors"), arrows flip; set the semantics to `fieldI
 
 The choice is **persisted** to the Feishu Bridge (shared per document + extension) and restored next time.
 
-### 3. Deployment
+### 4. Deployment
 
 The official way to ship a Base extension script is to **host the page yourself** and paste its URL
 into the Base "add script" dialog. There is no "upload and Feishu hosts it" CLI
@@ -102,6 +110,17 @@ Therefore:
 - Fallback: **"复制标题"** — paste into the TickTick search box.
 
 `@lark-base-open/js-sdk` exposes no API to open external protocols or links (all 1.0.2 exports checked).
+
+## When it refuses to open
+
+The red bar explains what failed, and **诊断信息** unfolds the facts needed to fix it:
+
+- whether the page is inside the Feishu host or a standalone window
+- every table in the base (name + id) and which one is selected
+- every link field found, and which of them point at *this* table
+
+The most common causes it distinguishes: the wrong table was opened, the table only has
+cross-table links (unsupported), or the host bridge never responded.
 
 ## Debugging (plain browser)
 

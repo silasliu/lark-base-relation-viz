@@ -2,10 +2,11 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { DependencyGraph } from './components/DependencyGraph'
 import { ChecklistPanel } from './components/ChecklistPanel'
 import { DetailsPanel } from './components/DetailsPanel'
-import { BaseDataService } from './services/BaseDataService'
+import { BaseDataService, type ScannedLinkField } from './services/BaseDataService'
 import { loadConfig, saveConfig, type PersistedConfig, type DependencyRole, type ParentRole } from './services/ConfigStore'
 import { applyCollapse, collapsibleKinds, EMPTY_COLLAPSE, type CollapseState } from './services/collapse'
 import { watchTable } from './services/DataWatcher'
+import { chooseTableId } from './services/tableChoice'
 import type {
   GraphNode,
   GraphData,
@@ -67,6 +68,19 @@ function App() {
   const [collapse, setCollapse] = useState<CollapseState>(EMPTY_COLLAPSE)
   const [liveTick, setLiveTick] = useState(0)
   const [liveOn, setLiveOn] = useState(true)
+  /**
+   * 自诊断信息。
+   * 打不开时用户不该只能看到一句「失败」——把环境、表、字段都摊开，
+   * 这样不用来回问就能定位是「选错表」「没有自关联字段」还是「宿主连不上」。
+   */
+  const [diag, setDiag] = useState<{
+    inHost: boolean
+    tables: string[]
+    activeTableId?: string
+    linkFields: ScannedLinkField[]
+  }>({ inHost: true, tables: [], linkFields: [] })
+  /** 运行环境是否已判定为本地 mock（判定发生在第一次读表之后） */
+  const [isMockEnv, setIsMockEnv] = useState(false)
 
   // 点空白处关闭导出菜单
   useEffect(() => {
@@ -98,10 +112,15 @@ function App() {
   useEffect(() => {
     let cancelled = false
     ;(async () => {
+      // 配置读取在非宿主环境下要等桥接超时，和读表并行跑，别让两条超时叠起来
+      const configPromise = loadConfig()
       try {
-        const saved = await loadConfig()
-        configRef.current = saved
+        setLoadStage('正在读取数据表…')
+        const list = await service.listTables()
+        const saved = await configPromise
         if (cancelled) return
+
+        configRef.current = saved
         setLayout(saved.layout)
         setDepRole(saved.dependencyRole)
         setParentRole(saved.parentRole)
@@ -110,19 +129,39 @@ function App() {
         const isNarrow = window.innerWidth < 620
         setSidebarCollapsed(isNarrow ? true : (saved.sidebarCollapsed ?? false))
 
-        setLoadStage('正在读取数据表…')
-        const list = await service.listTables()
-        if (cancelled) return
         setTables(list)
+        const mockEnv = service.isMock
+        setIsMockEnv(mockEnv)
+        setDiag((prev) => ({
+          ...prev,
+          inHost: !mockEnv,
+          tables: list.map((t) => `${t.name}（${t.id}）`),
+        }))
         if (list.length === 0) {
           setError('这个 Base 里还没有数据表。')
           return
         }
-        const preferred =
-          saved.tableId && list.some((t) => t.id === saved.tableId) ? saved.tableId : list[0].id
-        setTableId(preferred)
+
+        // 表的选择顺序：正在看的表 → 上次选的表 → 第一张。
+        // 「正在看的表」优先，是因为用户就是照着 URL 里那张表打开插件的；
+        // 以前盲选第一张，多表 Base 里会直接打开错误的表，看起来就是「什么都显示不出来」。
+        const activeId = await service.getActiveTableId()
+        if (cancelled) return
+        setTableId(
+          chooseTableId({
+            available: list.map((t) => t.id),
+            activeId,
+            savedId: saved.tableId,
+          }) ?? list[0].id,
+        )
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : '读取数据表列表失败')
+        if (!cancelled) {
+          // 出错时也要把环境如实写进诊断，否则会误报成「飞书宿主 iframe」
+          const mockEnv = service.isMock
+          setIsMockEnv(mockEnv)
+          setDiag((prev) => ({ ...prev, inHost: !mockEnv }))
+          setError(err instanceof Error ? err.message : '读取数据表列表失败')
+        }
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -142,8 +181,14 @@ function App() {
     setGraphData(null)
     ;(async () => {
       try {
-        const list = await service.listLinkFields(tableId)
+        // 扫全部关联字段（含跨表），这样「一个都没找到」和「找到的都是跨表」能区分开
+        const scanned = await service.scanLinkFields(tableId)
         if (cancelled) return
+        setDiag((prev) => ({ ...prev, activeTableId: tableId, linkFields: scanned }))
+
+        const list = scanned
+          .filter((f) => f.selfLink)
+          .map((f) => ({ id: f.id, name: f.name, targetTableId: f.targetTableId }))
         setFields(list)
 
         const saved = configRef.current
@@ -266,7 +311,7 @@ function App() {
 
   // 实时监听表格变更
   useEffect(() => {
-    if (!liveOn || !tableId || depFieldIds.length === 0 || service.isMock) return
+    if (!liveOn || !tableId || depFieldIds.length === 0 || isMockEnv) return
     const relevant = [...depFieldIds, parentFieldId].filter(Boolean) as string[]
     let timer: number | undefined
     const stop = watchTable({ tableId, relevantFieldIds: relevant }, () => {
@@ -278,7 +323,7 @@ function App() {
       window.clearTimeout(timer)
       stop()
     }
-  }, [liveOn, tableId, depFieldIds, parentFieldId, service.isMock])
+  }, [liveOn, tableId, depFieldIds, parentFieldId, isMockEnv])
 
   useEffect(() => {
     if (liveTick === 0) return
@@ -670,6 +715,25 @@ function App() {
           <button className="confirm-btn" onClick={analyze}>
             重试
           </button>
+          <details className="diag">
+            <summary>诊断信息</summary>
+            <div className="diag-body">
+              <div>运行环境：{diag.inHost ? '飞书宿主 iframe' : '独立窗口（没有连上宿主）'}</div>
+              <div>
+                数据表（{diag.tables.length}）：{diag.tables.join('、') || '—'}
+              </div>
+              <div>当前表：{tableId || '—'}</div>
+              <div>
+                关联字段（{diag.linkFields.length}）：
+                {diag.linkFields.length === 0
+                  ? '—'
+                  : diag.linkFields
+                      .map((f) => `${f.name} → ${f.selfLink ? '本表' : f.targetTableId || '未知表'}`)
+                      .join('、')}
+              </div>
+              <div>其中指向本表：{diag.linkFields.filter((f) => f.selfLink).length} 个</div>
+            </div>
+          </details>
         </div>
       )}
 
@@ -830,10 +894,27 @@ function App() {
             <p>{analyzing ? '正在读取表格…' : '选择数据表和字段后自动分析。'}</p>
             {fields.length === 0 && tables.length > 0 && (
               <div className="empty-hint">
-                <p>当前表没有「自关联字段」，无法表达任务关系。</p>
-                <p>
-                  需要建一个关联到本表的字段，例如「前置」：记录 B 的「前置」里放 A，表示 A 完成后才能做 B。
-                </p>
+                {diag.linkFields.length > 0 ? (
+                  <>
+                    <p>
+                      这张表有 {diag.linkFields.length} 个关联字段，但都指向**其它表**：
+                      插件只支持「关联到本表自己」的字段，所以画不出关系图。
+                    </p>
+                    <p>
+                      字段明细：
+                      {diag.linkFields
+                        .map((f) => `${f.name} → ${f.targetTableId || '未知表'}`)
+                        .join('、')}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p>当前表没有任何关联字段，无法表达任务关系。</p>
+                    <p>
+                      需要建一个关联到本表的字段，例如「前置」：记录 B 的「前置」里放 A，表示 A 完成后才能做 B。
+                    </p>
+                  </>
+                )}
               </div>
             )}
           </div>
