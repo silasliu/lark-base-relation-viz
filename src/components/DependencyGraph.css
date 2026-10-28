@@ -1,0 +1,68 @@
+.dependency-graph-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/*
+ * canvas 绝对定位，脱离文档流。
+ * 关键：G6 会把 canvas 元素设成图的实际尺寸，若它在文档流里就会撑大父容器，
+ * 父容器变大 → ResizeObserver 触发 → changeSize 更大 → 再撑大，形成无限拉伸。
+ * 绝对定位后它再大也撑不动父容器，循环从物理上断掉。
+ */
+.graph-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.graph-canvas canvas {
+  display: block;
+}
+
+/* 悬浮缩放控制 */
+.graph-controls {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 5;
+}
+
+.graph-ctrl-btn {
+  min-width: 34px;
+  height: 34px;
+  padding: 0 10px;
+  font-size: 16px;
+  font-family: inherit;
+  color: #1f2329;
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid #dee0e3;
+  border-radius: 8px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(31, 35, 41, 0.08);
+  transition: all 0.15s ease;
+}
+
+.graph-ctrl-btn:hover {
+  border-color: #3370ff;
+  color: #3370ff;
+  background: #fff;
+}
+
+.graph-ctrl-btn.wide {
+  font-size: 12px;
+  font-weight: 500;
+  height: 30px;
+}
+
+.graph-canvas {
+  /* 滚轮不穿透到飞书外层页面 */
+  overscroll-behavior: contain;
+}

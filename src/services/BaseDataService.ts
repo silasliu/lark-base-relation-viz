@@ -1,0 +1,316 @@
+import { bitable, FieldType } from '@lark-base-open/js-sdk'
+import type { BaseTask, GraphData, TableOption, LinkFieldOption, BuildOptions } from '../types'
+import { config } from '../config'
+import { buildGraphData } from './graphBuilder'
+
+/**
+ * 开发调试回退：在飞书宿主之外（浏览器直接打开）时，SDK 永不 resolve。
+ * 此时加载 public/mock-data.json（从真实 Base 导出的快照，gitignore），
+ * 让布局/交互可以在浏览器里直接调试。生产构建同样适用——宿主内永远不会走到这条路。
+ */
+interface MockData {
+  _comment?: string
+  _tables?: { id: string; name: string }[]
+  /** 字段元数据：mock 路径用它把「字段名 → fieldId」解析出来（与宿主 getFieldMetaList 等价） */
+  _fieldMeta?: { id: string; name: string; isPrimary?: boolean }[]
+  records: { recordId: string; fields: Record<string, unknown> }[]
+}
+
+let mockCache: MockData | null = null
+
+async function loadMock(): Promise<MockData> {
+  if (mockCache) return mockCache
+  const res = await fetch('mock-data.json')
+  if (!res.ok) {
+    // 生产构建刻意不打包 mock 数据（那是真实 Base 快照，仓库公开，不能发布）。
+    // 所以在飞书之外直接打开部署地址时，这里没有数据可用——给一句人话，而不是开发术语。
+    throw new Error(
+      import.meta.env.DEV
+        ? '浏览器直开模式需要 public/mock-data.json（未找到）'
+        : '请在飞书多维表格中打开这个插件；直接用浏览器访问时没有可显示的数据。',
+    )
+  }
+  mockCache = await res.json()
+  return mockCache
+}
+
+/** 是否处于飞书宿主内（扩展脚本以 iframe 形式运行） */
+function probablyInHost(): boolean {
+  return typeof window !== 'undefined' && window.parent !== window
+}
+
+/**
+ * 单次请求的记录数上限。
+ * SDK 文档明确：pageSize 默认 200，**最大不得超过 200**。
+ * 超过时宿主会直接报 `single record operation exceeds records limit`。
+ * 更大的表靠 pageToken 翻页，不要往上调。
+ */
+const PAGE_SIZE = 200
+
+/** SDK 在非宿主环境下可能永不 resolve，必须自己设超时兜底 */
+const HOST_TIMEOUT_MS = 10_000
+
+const HOST_TIMEOUT_MESSAGE =
+  '连接多维表格宿主超时。这个页面需要作为「多维表格扩展程序」在飞书里打开，直接用浏览器访问是读不到表的。'
+
+function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error(message)), HOST_TIMEOUT_MS)
+    }),
+  ])
+}
+
+interface TextLike {
+  text?: string
+}
+
+/** 单元格 → 纯文本 */
+function cellToText(value: unknown): string {
+  if (value == null) return ''
+  if (Array.isArray(value)) {
+    return value
+      .map((v) => cellToText(v))
+      .filter((s) => s !== '')
+      .join(', ')
+  }
+  if (typeof value === 'object') {
+    const v = value as TextLike
+    return 'text' in v ? String(v.text ?? '') : ''
+  }
+  return String(value)
+}
+
+/** 单元格 → 字符串数组 */
+function cellToArray(value: unknown): string[] {
+  if (value == null) return []
+  if (Array.isArray(value)) {
+    return value.flatMap((v) => cellToArray(v)).filter((s) => s !== '')
+  }
+  if (typeof value === 'object') {
+    const text = cellToText(value)
+    return text ? [text] : []
+  }
+  const text = String(value).trim()
+  return text ? [text] : []
+}
+
+/** 关联字段 → recordId 列表（兼容 recordIds / record_ids 两种键名） */
+function cellToRecordIds(value: unknown): string[] {
+  if (value == null) return []
+  const items = Array.isArray(value) ? value : [value]
+  const ids: string[] = []
+  for (const item of items) {
+    if (item == null || typeof item !== 'object') continue
+    const link = item as { recordIds?: string[]; record_ids?: string[] }
+    for (const id of link.recordIds ?? link.record_ids ?? []) {
+      if (typeof id === 'string' && id !== '' && !ids.includes(id)) ids.push(id)
+    }
+  }
+  return ids
+}
+
+/** 时间戳 → YYYY-MM-DD（Asia/Shanghai） */
+function cellToDate(value: unknown): string | undefined {
+  const text = cellToText(value)
+  if (!text) return undefined
+  const num = Number(text)
+  if (Number.isFinite(num) && num > 0) {
+    const d = new Date(num)
+    if (!Number.isNaN(d.getTime())) {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(d)
+    }
+  }
+  return text.slice(0, 10)
+}
+
+/**
+ * 读取多维表格并构建依赖图。
+ * 插件运行在飞书宿主中，鉴权由宿主提供，无需 token。
+ */
+export class BaseDataService {
+  /** 是否运行在模拟数据模式（浏览器直开调试） */
+  readonly isMock = !probablyInHost()
+
+  /** 当前 Base 里的所有数据表 */
+  async listTables(): Promise<TableOption[]> {
+    if (this.isMock) {
+      const mock = await loadMock()
+      return mock._tables ?? []
+    }
+    const metas = await withTimeout(bitable.base.getTableMetaList(), HOST_TIMEOUT_MESSAGE)
+    return metas.map((m) => ({ id: m.id, name: m.name }))
+  }
+
+  /**
+   * 某张表里的自关联字段（可作为依赖或父子来源）。
+   * 只有「关联到本表自己」的字段才有图上的语义，跨表关联不参与。
+   */
+  async listLinkFields(tableId: string): Promise<LinkFieldOption[]> {
+    if (this.isMock) {
+      const mock = await loadMock()
+      const dep = mock._fieldMeta?.find((f) => f.name === 'r前置')
+      const parent = mock._fieldMeta?.find((f) => f.name === '父记录')
+      const list: LinkFieldOption[] = []
+      if (dep) list.push({ id: dep.id, name: dep.name, targetTableId: tableId })
+      if (parent) list.push({ id: parent.id, name: parent.name, targetTableId: tableId })
+      return list
+    }
+    const table = await withTimeout(bitable.base.getTableById(tableId), HOST_TIMEOUT_MESSAGE)
+    const metas = await withTimeout(table.getFieldMetaList(), HOST_TIMEOUT_MESSAGE)
+
+    const result: LinkFieldOption[] = []
+    for (const meta of metas) {
+      if (meta.type !== FieldType.SingleLink && meta.type !== FieldType.DuplexLink) continue
+      const property = (meta as { property?: { tableId?: string } }).property
+      const targetTableId = property?.tableId ?? ''
+      if (targetTableId !== tableId) continue
+      result.push({ id: meta.id, name: meta.name, targetTableId })
+    }
+    return result
+  }
+
+  /**
+   * 读取指定表的记录。
+   * @param tableId 数据表
+   * @param dependencyFieldId 依赖字段（前置 → 任务，绿/红边）
+   * @param parentFieldId 父子字段（父 → 子，灰虚线边），可空 = 不画父子
+   */
+  async loadTasks(
+    tableId: string,
+    dependencyFieldId: string,
+    parentFieldId?: string,
+  ): Promise<BaseTask[]> {
+    // 浏览器直开 → mock 快照（走与宿主完全相同的归一化路径，字段元数据从 _fieldMeta 取）
+    if (this.isMock) {
+      const mock = await loadMock()
+      const metas = mock._fieldMeta ?? []
+      const idByName = new Map(metas.map((m) => [m.name, m.id]))
+      const primary = metas.find((m) => m.isPrimary)
+      const optional = config.optionalFields
+      return normalizeRecords(mock.records, {
+        titleId: primary?.id,
+        statusId: idByName.get(optional.status),
+        tagsId: idByName.get(optional.tags),
+        dueId: idByName.get(optional.dueDate),
+        didaIdFieldId: idByName.get(optional.didaId),
+        projectIdId: idByName.get(optional.projectId),
+        listId: idByName.get(optional.list),
+        descriptionId: optional.descriptionCandidates
+          .map((n) => idByName.get(n))
+          .find((id) => Boolean(id)),
+        dependencyFieldId,
+        parentFieldId,
+      })
+    }
+
+    const table = await withTimeout(bitable.base.getTableById(tableId), HOST_TIMEOUT_MESSAGE)
+    const metas = await withTimeout(table.getFieldMetaList(), HOST_TIMEOUT_MESSAGE)
+
+    const idByName = new Map(metas.map((m) => [m.name, m.id]))
+    const primary = metas.find((m) => m.isPrimary)
+
+    const titleId = primary?.id
+    const optional = config.optionalFields
+    const fieldIds = {
+      titleId,
+      statusId: idByName.get(optional.status),
+      tagsId: idByName.get(optional.tags),
+      dueId: idByName.get(optional.dueDate),
+      didaIdFieldId: idByName.get(optional.didaId),
+      projectIdId: idByName.get(optional.projectId),
+      listId: idByName.get(optional.list),
+      descriptionId: optional.descriptionCandidates
+        .map((n) => idByName.get(n))
+        .find((id) => Boolean(id)),
+      dependencyFieldId,
+      parentFieldId,
+    }
+
+    const tasks: BaseTask[] = []
+    let pageToken: string | undefined
+    let pages = 0
+
+    do {
+      let page: {
+        records: Array<{ recordId: string; fields: Record<string, unknown> }>
+        hasMore: boolean
+        pageToken?: unknown
+      }
+      try {
+        page = await withTimeout(
+          table.getRecordsByPage({
+            pageSize: PAGE_SIZE,
+            pageToken: pageToken as never,
+          }),
+          HOST_TIMEOUT_MESSAGE,
+        )
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err)
+        throw new Error(`读取记录失败（已读到 ${tasks.length} 条）：${reason}`)
+      }
+
+      tasks.push(...normalizeRecords(page.records, fieldIds))
+
+      const next = page.hasMore ? String(page.pageToken ?? '') : ''
+      pageToken = next && next !== pageToken ? next : undefined
+      pages += 1
+    } while (pageToken && pages < 200)
+
+    return tasks
+  }
+
+  /** 构建依赖图（纯逻辑见 graphBuilder） */
+  buildGraphData(tasks: BaseTask[], options?: BuildOptions): GraphData {
+    return buildGraphData(tasks, options)
+  }
+}
+
+/** 记录页 → BaseTask[]（宿主与 mock 共用的归一化） */
+function normalizeRecords(
+  records: Array<{ recordId: string; fields: Record<string, unknown> }>,
+  ids: {
+    titleId?: string
+    statusId?: string
+    tagsId?: string
+    dueId?: string
+    didaIdFieldId?: string
+    projectIdId?: string
+    listId?: string
+    descriptionId?: string
+    dependencyFieldId: string
+    parentFieldId?: string
+  },
+): BaseTask[] {
+  const tasks: BaseTask[] = []
+  for (const record of records) {
+    const get = (fieldId?: string) => (fieldId ? record.fields[fieldId] : undefined)
+    tasks.push({
+      recordId: record.recordId,
+      didaId: cellToText(get(ids.didaIdFieldId)) || undefined,
+      title: ids.titleId ? cellToText(get(ids.titleId)) : '',
+      status: cellToArray(get(ids.statusId)),
+      tags: cellToArray(get(ids.tagsId)),
+      dueDate: cellToDate(get(ids.dueId)),
+      prerequisites: cellToRecordIds(get(ids.dependencyFieldId)),
+      parentRecordId: ids.parentFieldId
+        ? cellToRecordIds(get(ids.parentFieldId))[0]
+        : undefined,
+      projectId: cellToText(get(ids.projectIdId)) || undefined,
+      listName: cellToArray(get(ids.listId))[0] || undefined,
+      description: cellToText(get(ids.descriptionId)).trim() || undefined,
+    })
+  }
+  for (const task of tasks) {
+    if (!task.title) task.title = task.recordId
+  }
+  return tasks
+}
+
+/** 记录页 → BaseTask[]（宿主与 mock 共用的归一化） */
