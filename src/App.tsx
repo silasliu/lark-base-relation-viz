@@ -262,10 +262,34 @@ function App() {
       const data = service.buildGraphData(tasks, buildOptions())
 
       if (tasks.length === 0) throw new Error('这张表里没有任何记录。')
+
       if (data.nodes.length === 0) {
+        const tableName = (id: string) => tables.find((t) => t.id === id)?.name ?? id
+        const depName = fields.find((f) => f.id === depFieldIds[0])?.name ?? '关联字段'
+
+        // 当前表画不出图时，先试着切回上次真的画出过关系的那张表。
+        // 统计类表（比如「每日赏金统计」）经常就是这么个死胡同：
+        // 表里有关联字段但一条都没填，留在原地只能看到一片空白。
+        const lastGood = configRef.current?.lastGoodTableId
+        if (
+          lastGood &&
+          lastGood !== tableId &&
+          tables.some((t) => t.id === lastGood) &&
+          (await service.tableHasRelations(lastGood))
+        ) {
+          if (seq !== analyzeSeq.current) return
+          showToast(`「${tableName(tableId)}」没有关系数据，已切回「${tableName(lastGood)}」`)
+          setTableId(lastGood)
+          return
+        }
+
+        const filled = tasks.filter((t) => (t.prerequisites ?? []).length > 0).length
         throw new Error(
-          `读到 ${tasks.length} 条记录，但没有任何${showParent ? '依赖或父子' : '依赖'}关系，没有可绘制的图。\n` +
-            `可以换一个字段，或在表里给任务填上关联记录。`,
+          filled === 0
+            ? `「${tableName(tableId)}」有 ${tasks.length} 条记录，但字段「${depName}」一条都没有填。\n` +
+              `先在表里给任务填上关联记录，再点刷新。`
+            : `「${tableName(tableId)}」读到 ${tasks.length} 条记录，其中 ${filled} 条填了关联，` +
+              `但都没有指向本表的有效记录，画不出关系。`,
         )
       }
 
@@ -273,6 +297,8 @@ function App() {
       setGraphData(data)
       setSelectedNode(null)
       setCollapse(EMPTY_COLLAPSE)
+      // 记住「真的能画出图」的表，下次在别的表上扑空时可以切回来
+      if (configRef.current?.lastGoodTableId !== tableId) persist({ lastGoodTableId: tableId })
     } catch (err) {
       if (seq !== analyzeSeq.current) return
       setError(err instanceof Error ? err.message : '分析失败')
@@ -283,7 +309,7 @@ function App() {
         setReadProgress('')
       }
     }
-  }, [tableId, depFieldIds, parentFieldId, showParent, service, buildOptions, onReadProgress])
+  }, [tableId, depFieldIds, parentFieldId, showParent, service, buildOptions, onReadProgress, tables, fields, showToast, persist])
 
   /** 静默刷新：保留选中、折叠、缩放，只更新数据 */
   const silentAnalyze = useCallback(async () => {

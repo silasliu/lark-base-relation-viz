@@ -20,6 +20,18 @@ A read-only view of task dependencies and parent-child relations in a Feishu Bas
 - **全屏** — fills the plugin's own area only (toolbar and sidebar hidden, `Esc` to leave). It does **not** open a new window or tab, and does not rely on the browser Fullscreen API, which a Feishu iframe may refuse.
 - **Sidebar** — collapsible; on narrow screens (Feishu side panel) it moves to the bottom, collapsed as a single row and expanded to the lower half, without covering the canvas.
 
+## Which tasks appear
+
+Only **unfinished** tasks seed the graph. A task counts as unfinished when its status is:
+
+- missing entirely (no status field, or an empty cell) → **unfinished**
+- one of the known done values (`已完成`, `完成`, `done`, `closed`, `completed`, `已关闭`) → done
+- anything else → unfinished
+
+The first rule matters: tables with no status field at all (statistics tables, for example) used to be
+read as "everything is done", so nothing was drawn. Showing a task that is actually done is a much
+smaller error than hiding the whole table.
+
 ## Reading large tables
 
 `getRecordsByPage` is capped at 200 records per request, so larger tables are read page by page. The

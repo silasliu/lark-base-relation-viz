@@ -33,6 +33,11 @@ export interface PersistedConfig {
   showParent?: boolean
   /** 侧栏是否收起 */
   sidebarCollapsed?: boolean
+  /**
+   * 上一次「真的画出了关系」的表。
+   * 当前表没有关系数据时会自动切回它，避免用户在统计表上看到一片空白。
+   */
+  lastGoodTableId?: string
 }
 
 export const DEFAULT_CONFIG: PersistedConfig = {
@@ -119,5 +124,6 @@ export function migrateConfig(raw: unknown): PersistedConfig {
     ),
     showParent: asBoolean(data.showParent, true),
     sidebarCollapsed: asBoolean(data.sidebarCollapsed, false),
+    lastGoodTableId: asString(data.lastGoodTableId),
   }
 }

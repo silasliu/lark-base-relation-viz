@@ -73,3 +73,17 @@ test('迁移不会修改传入对象', () => {
   migrateConfig(raw)
   assert.deepEqual(raw, { version: 1, dependencyFieldId: 'fldDep' })
 })
+
+test('「上次有数据的表」会被保留（用于空表自动切回）', () => {
+  const migrated = migrateConfig({
+    version: 2,
+    dependencyFieldIds: ['f1'],
+    lastGoodTableId: 'tblWork',
+  })
+  assert.equal(migrated.lastGoodTableId, 'tblWork')
+})
+
+test('没有 lastGoodTableId 时是 undefined，不影响其它字段', () => {
+  const migrated = migrateConfig({ version: 2, dependencyFieldIds: ['f1'] })
+  assert.equal(migrated.lastGoodTableId, undefined)
+})

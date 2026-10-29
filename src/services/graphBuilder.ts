@@ -12,10 +12,39 @@ import type {
 /** 视为「未完成」的状态值 */
 const INCOMPLETE_STATUSES = new Set(['打开', '进行中', 'open', 'in_progress', 'todo'])
 
+/** 明确表示「已完成」的状态值 */
+const DONE_STATUSES = new Set([
+  '已完成',
+  '完成',
+  '已关闭',
+  '关闭',
+  'done',
+  'closed',
+  'complete',
+  'completed',
+  'finished',
+])
+
+/**
+ * 任务是否未完成。
+ *
+ * 三条规则，顺序很重要：
+ * 1. 没有状态字段、或这一格是空的 → **算未完成**。
+ *    以前这里是「空 = 已完成」，结果是没有状态字段的表（比如各种统计表）
+ *    一条记录都进不了图，表现就是「读到 368 条，但没有任何关系」。
+ * 2. 明确写着完成类的值 → 已完成。
+ * 3. 其余（打开 / 进行中 / 自定义进度词）→ 未完成。
+ *
+ * 宁可把已完成的任务多显示一次，也不要把整张表藏起来。
+ */
 export function isIncomplete(status?: string | string[]): boolean {
   const raw = Array.isArray(status) ? status[0] : status
   const normalized = String(raw ?? '').split(',')[0].trim().toLowerCase()
-  return INCOMPLETE_STATUSES.has(normalized)
+  if (!normalized) return true
+  if (DONE_STATUSES.has(normalized)) return false
+  if (INCOMPLETE_STATUSES.has(normalized)) return true
+  // 认不出来的状态词按未完成处理（上面两条已经覆盖了明确的完成/进行中）
+  return true
 }
 
 /** 从标题里抽出开头的 emoji */

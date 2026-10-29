@@ -3,6 +3,7 @@ import type { BaseTask, GraphData, TableOption, LinkFieldOption, BuildOptions } 
 import { config } from '../config'
 import { buildGraphData } from './graphBuilder'
 import { readAllPages } from './pagination'
+import { cellToRecordIds, looksLikeLinkCell } from './cellValues'
 
 /**
  * 开发调试回退：在飞书宿主之外（浏览器直接打开）时，SDK 永不 resolve。
@@ -102,30 +103,6 @@ function cellToArray(value: unknown): string[] {
   }
   const text = String(value).trim()
   return text ? [text] : []
-}
-
-/** 单元格看起来是不是「关联记录引用」：数组且至少一项带 recordIds/record_ids */
-function looksLikeLinkCell(value: unknown): boolean {
-  if (!Array.isArray(value) || value.length === 0) return false
-  const first = value[0]
-  if (!first || typeof first !== 'object') return false
-  const link = first as { recordIds?: unknown; record_ids?: unknown }
-  return Array.isArray(link.recordIds) || Array.isArray(link.record_ids)
-}
-
-/** 关联字段 → recordId 列表（兼容 recordIds / record_ids 两种键名） */
-function cellToRecordIds(value: unknown): string[] {
-  if (value == null) return []
-  const items = Array.isArray(value) ? value : [value]
-  const ids: string[] = []
-  for (const item of items) {
-    if (item == null || typeof item !== 'object') continue
-    const link = item as { recordIds?: string[]; record_ids?: string[] }
-    for (const id of link.recordIds ?? link.record_ids ?? []) {
-      if (typeof id === 'string' && id !== '' && !ids.includes(id)) ids.push(id)
-    }
-  }
-  return ids
 }
 
 /** 时间戳 → YYYY-MM-DD（Asia/Shanghai） */
@@ -293,6 +270,24 @@ export class BaseDataService {
     return all
       .filter((f) => f.selfLink)
       .map((f) => ({ id: f.id, name: f.name, targetTableId: f.targetTableId }))
+  }
+
+  /**
+   * 某张表里有没有「填了值」的自关联关系。
+   * 用来在「当前表画不出图」时判断要不要切回上次那张能画的表。
+   */
+  async tableHasRelations(tableId: string): Promise<boolean> {
+    try {
+      const links = await this.listLinkFields(tableId)
+      if (links.length === 0) return false
+      const tasks = await this.loadTasks(
+        tableId,
+        links.map((l) => l.id),
+      )
+      return tasks.some((t) => (t.prerequisites ?? []).length > 0)
+    } catch {
+      return false
+    }
   }
 
   /**
