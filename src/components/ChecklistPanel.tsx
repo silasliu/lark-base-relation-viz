@@ -13,6 +13,12 @@ interface ChecklistPanelProps {
   onLocate: (node: GraphNode) => void
   filter: ChecklistFilter
   onFilterChange: (f: ChecklistFilter) => void
+  /**
+   * 是否配置了「完成状态」字段。
+   * 没有状态信息时，「可动手 / 被阻塞 / 已完成」三类根本分不出来，
+   * 所以只保留「全部」，免得给出假的分类。
+   */
+  hasStatus?: boolean
 }
 
 type Section = 'ready' | 'blocked' | 'done' | 'all'
@@ -37,8 +43,12 @@ export function ChecklistPanel({
   onLocate,
   filter,
   onFilterChange,
+  hasStatus = true,
 }: ChecklistPanelProps) {
-  const [section, setSection] = useState<Section>('ready')
+  const sections: Section[] = hasStatus ? ['ready', 'blocked', 'done', 'all'] : ['all']
+  const [rawSection, setSection] = useState<Section>('ready')
+  // 没有状态信息时退回「全部」
+  const section: Section = sections.includes(rawSection) ? rawSection : 'all'
   const [query, setQuery] = useState('')
 
   const checklist = useMemo(() => buildChecklist(data), [data])
@@ -110,7 +120,7 @@ export function ChecklistPanel({
       )}
 
       <div className="checklist-tabs">
-        {(['ready', 'blocked', 'done', 'all'] as Section[]).map((s) => (
+        {sections.map((s) => (
           <button
             key={s}
             className={`checklist-tab ${section === s ? 'active' : ''}`}
@@ -137,7 +147,7 @@ export function ChecklistPanel({
           <button
             key={node.id}
             className={`checklist-item ${selectedId === node.id ? 'active' : ''} ${
-              node.isIncomplete ? '' : 'done'
+              node.state === 'done' ? 'done' : ''
             }`}
             onClick={() => onLocate(node)}
             title={node.rawTitle}
@@ -153,7 +163,11 @@ export function ChecklistPanel({
                   {node.overdueDays ? ` 逾期${node.overdueDays}天` : ''}
                 </span>
               )}
-              {node.blocksCount > 0 && <span className="blocked-badge">阻塞 {node.blocksCount}</span>}
+              {node.state !== 'unknown' && node.blocksCount > 0 && (
+                <span className="blocked-badge">
+                  {node.state === 'done' ? '解锁' : '阻塞'} {node.blocksCount}
+                </span>
+              )}
               {node.prerequisiteCount > 0 && node.blockingCount === 0 && (
                 <span className="prereq-badge">{node.prerequisiteCount} 前置</span>
               )}

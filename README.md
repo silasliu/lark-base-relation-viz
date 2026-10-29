@@ -20,17 +20,32 @@ A read-only view of task dependencies and parent-child relations in a Feishu Bas
 - **全屏** — fills the plugin's own area only (toolbar and sidebar hidden, `Esc` to leave). It does **not** open a new window or tab, and does not rely on the browser Fullscreen API, which a Feishu iframe may refuse.
 - **Sidebar** — collapsible; on narrow screens (Feishu side panel) it moves to the bottom, collapsed as a single row and expanded to the lower half, without covering the canvas.
 
-## Which tasks appear
+## Which tasks appear, and what "done" means
 
-Only **unfinished** tasks seed the graph. A task counts as unfinished when its status is:
+Only **unfinished** records seed the graph. "Unfinished" is decided by a status field you pick:
 
-- missing entirely (no status field, or an empty cell) → **unfinished**
-- one of the known done values (`已完成`, `完成`, `done`, `closed`, `completed`, `已关闭`) → done
-- anything else → unfinished
+- **更多 → 完成状态** lists every single-select / multi-select field in the table.
+- Pick one, then tick the options that mean **done** (选项 id 与名称都会参与匹配，所以改名字也不会漏判).
+- A record counts as done when any of its selected options is ticked.
+- Picking 「不用状态（中性）」 turns the judgement off entirely.
 
-The first rule matters: tables with no status field at all (statistics tables, for example) used to be
-read as "everything is done", so nothing was drawn. Showing a task that is actually done is a much
-smaller error than hiding the whole table.
+On first use the plugin picks a field named like `状态 / status / stage` and pre-ticks the obvious
+options (`已完成`, `Done`, …), skipping anything that reads like `未完成 / 已开始`. You change it once
+and it is remembered.
+
+### Neutral mode (no status field)
+
+Without a status field the plugin does **not** pretend everything is blocked. Instead:
+
+| | with status | neutral |
+|---|---|---|
+| Dependency edge colour | red / green / gray | **light blue** `#a8c0f5` |
+| `阻塞 / 解锁` badge | shown | hidden |
+| Checklist tabs | 可动手 / 被阻塞 / 已完成 / 全部 | **全部** only |
+| Legend | three states | adds 「状态未知」 |
+
+This matters because a table with no status column used to render every edge red — which reads as
+"you are blocked" when the truth is "we don't know".
 
 ## Reading large tables
 

@@ -7,45 +7,8 @@ import type {
   LinkedTaskRef,
   DependencyRole,
   GraphRelation,
+  EdgeState,
 } from '../types'
-
-/** 视为「未完成」的状态值 */
-const INCOMPLETE_STATUSES = new Set(['打开', '进行中', 'open', 'in_progress', 'todo'])
-
-/** 明确表示「已完成」的状态值 */
-const DONE_STATUSES = new Set([
-  '已完成',
-  '完成',
-  '已关闭',
-  '关闭',
-  'done',
-  'closed',
-  'complete',
-  'completed',
-  'finished',
-])
-
-/**
- * 任务是否未完成。
- *
- * 三条规则，顺序很重要：
- * 1. 没有状态字段、或这一格是空的 → **算未完成**。
- *    以前这里是「空 = 已完成」，结果是没有状态字段的表（比如各种统计表）
- *    一条记录都进不了图，表现就是「读到 368 条，但没有任何关系」。
- * 2. 明确写着完成类的值 → 已完成。
- * 3. 其余（打开 / 进行中 / 自定义进度词）→ 未完成。
- *
- * 宁可把已完成的任务多显示一次，也不要把整张表藏起来。
- */
-export function isIncomplete(status?: string | string[]): boolean {
-  const raw = Array.isArray(status) ? status[0] : status
-  const normalized = String(raw ?? '').split(',')[0].trim().toLowerCase()
-  if (!normalized) return true
-  if (DONE_STATUSES.has(normalized)) return false
-  if (INCOMPLETE_STATUSES.has(normalized)) return true
-  // 认不出来的状态词按未完成处理（上面两条已经覆盖了明确的完成/进行中）
-  return true
-}
 
 /** 从标题里抽出开头的 emoji */
 export function extractEmoji(title: string): string {
@@ -138,7 +101,8 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
       id: nodeId(task.recordId),
       title: stripEmoji(task.title) || task.title,
       emoji: extractEmoji(task.title),
-      isIncomplete: isIncomplete(task.status),
+      isIncomplete: task.state === 'todo',
+      state: task.state,
     }
   }
 
@@ -209,8 +173,10 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
   // ── 种子与闭包 ──
   // 种子只看依赖关系：父子关系是附加信息，不该单独撑起节点。
   // 开启父子时，闭包会把它连带拉进来；关掉时不出现。
+  const isDone = (task: BaseTask | undefined) => task?.state === 'done'
   const seeds = tasks.filter((t) => {
-    if (!isIncomplete(t.status)) return false
+    // 未知（没配置状态字段）也要进图，否则整张表会被判成「全部已完成」
+    if (isDone(t)) return false
     return (
       (prereqMap.get(t.recordId)?.length ?? 0) > 0 ||
       (dependentsMap.get(t.recordId)?.length ?? 0) > 0
@@ -251,7 +217,7 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
     let count = 0
     for (const id of seen) {
       if (id === startId) continue
-      if (isIncomplete(taskMap.get(id)?.status)) count += 1
+      if (!isDone(taskMap.get(id))) count += 1
     }
     return count
   }
@@ -265,7 +231,7 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
     const title = stripEmoji(task.title) || task.title
     const prereqs = prereqMap.get(recordId) ?? []
     const succs = dependentsMap.get(recordId) ?? []
-    const inc = isIncomplete(task.status)
+    const inc = task.state === 'todo'
     const toRef = (id: string) => refOf(taskMap.get(id))
 
     nodes.push({
@@ -280,11 +246,12 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
       overdueDays: overdueDays(task.dueDate, inc),
       tags: task.tags ?? [],
       status: (task.status ?? []).join(', '),
+      state: task.state,
       isIncomplete: inc,
       isTerminal: prereqs.length === 0,
       prerequisiteCount: prereqs.length,
       successorCount: succs.length,
-      blockingCount: prereqs.filter((p) => isIncomplete(taskMap.get(p)?.status)).length,
+      blockingCount: prereqs.filter((p) => !isDone(taskMap.get(p))).length,
       blocksCount: blockedDownstream(recordId),
       didaId: task.didaId,
       projectId: task.projectId,
@@ -308,6 +275,19 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
   // ── 边 ──
   // 依赖边方向：任务 → 前置（箭头指向「它在等的那件事」）。
   // 颜色只看状态；relationId 交给样式注册表决定线型与箭头。
+  /**
+   * 边的颜色状态。
+   * 只要有一端状态未知，就退到 neutral —— 不做任何判断，
+   * 也不假装成「正在阻塞」。这是没有状态字段的表不出错的关键。
+   */
+  const edgeStateOf = (taskId: string, prereqId: string): EdgeState => {
+    const src = taskMap.get(taskId)?.state ?? 'unknown'
+    const pre = taskMap.get(prereqId)?.state ?? 'unknown'
+    if (src === 'unknown' || pre === 'unknown') return 'neutral'
+    if (src === 'done') return 'idle'
+    return pre === 'done' ? 'ready' : 'blocked'
+  }
+
   const edges: GraphEdge[] = []
   for (const pair of depPairs) {
     if (!involved.has(pair.taskId) || !involved.has(pair.prereqId)) continue
@@ -316,8 +296,7 @@ export function buildGraphData(tasks: BaseTask[], opts: BuildOptions = {}): Grap
       target: nodeId(pair.prereqId),
       kind: 'dependency',
       relationId: pair.relationId,
-      prerequisiteComplete: !isIncomplete(taskMap.get(pair.prereqId)?.status),
-      sourceComplete: !isIncomplete(taskMap.get(pair.taskId)?.status),
+      state: edgeStateOf(pair.taskId, pair.prereqId),
     })
   }
 
@@ -373,8 +352,9 @@ export function buildChecklist(data: GraphData): {
   const toItems = (nodes: GraphNode[]): ChecklistItem[] =>
     nodes.map((node) => ({
       node,
-      ready: node.isIncomplete && node.blockingCount === 0,
-      blocked: node.isIncomplete && node.blockingCount > 0,
+      // 状态未知的按「可动手」处理：没信息就别拦着人看
+      ready: node.state !== 'done' && node.blockingCount === 0,
+      blocked: node.state === 'todo' && node.blockingCount > 0,
     }))
 
   const byDue = (a: ChecklistItem, b: ChecklistItem) => {
@@ -388,6 +368,6 @@ export function buildChecklist(data: GraphData): {
   return {
     ready: items.filter((i) => i.ready).sort(byDue),
     blocked: items.filter((i) => i.blocked).sort(byDue),
-    done: items.filter((i) => !i.node.isIncomplete).sort(byDue),
+    done: items.filter((i) => i.node.state === 'done').sort(byDue),
   }
 }

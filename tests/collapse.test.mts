@@ -13,6 +13,7 @@ function node(id: string): GraphNode {
     rawTitle: id,
     tags: [],
     status: '打开',
+    state: 'todo',
     isIncomplete: true,
     isTerminal: true,
     prerequisiteCount: 0,

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { cellToRecordIds, looksLikeLinkCell } from '../src/services/cellValues.ts'
+import { cellToRecordIds, cellToOptionKeys, looksLikeLinkCell } from '../src/services/cellValues.ts'
 
 test('双向关联：recordIds 数组', () => {
   assert.deepEqual(cellToRecordIds([{ recordIds: ['recAAA111111'] }]), ['recAAA111111'])
@@ -47,4 +47,27 @@ test('looksLikeLinkCell 与实际解析保持一致', () => {
   assert.equal(looksLikeLinkCell([{ text: '12-30' }]), false)
   assert.equal(looksLikeLinkCell([]), false)
   assert.equal(looksLikeLinkCell(null), false)
+})
+
+// ── 单选 / 多选选项 ──
+
+test('选项单元格：id 与名称都要取到', () => {
+  assert.deepEqual(cellToOptionKeys([{ id: 'optAAA', text: '已完成' }]), ['optAAA', '已完成'])
+})
+
+test('选项单元格：只有名称时也能用', () => {
+  assert.deepEqual(cellToOptionKeys(['进行中']), ['进行中'])
+})
+
+test('多选：多个选项都要收', () => {
+  assert.deepEqual(
+    cellToOptionKeys([{ id: 'o1', name: '已完成' }, { id: 'o2', name: '已归档' }]),
+    ['o1', '已完成', 'o2', '已归档'],
+  )
+})
+
+test('选项单元格空值安全', () => {
+  assert.deepEqual(cellToOptionKeys(null), [])
+  assert.deepEqual(cellToOptionKeys([]), [])
+  assert.deepEqual(cellToOptionKeys([{}]), [])
 })

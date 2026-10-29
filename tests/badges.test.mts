@@ -13,6 +13,7 @@ function node(patch: Partial<GraphNode>): GraphNode {
     rawTitle: 'n',
     tags: [],
     status: '打开',
+    state: 'todo',
     isIncomplete: true,
     isTerminal: true,
     prerequisiteCount: 0,
@@ -35,11 +36,15 @@ test('未完成：显示「阻塞：N」', () => {
 })
 
 test('已完成：同样的数字显示为「解锁：N」', () => {
-  const badge = badgeOf(node({ isIncomplete: false, blocksCount: 2 }))
+  const badge = badgeOf(node({ state: 'done', isIncomplete: false, blocksCount: 2 }))
   assert.deepEqual(badge, { text: '解锁：2', kind: 'unlock' })
+})
+
+test('状态未知时不出徽标（中性模式）', () => {
+  assert.equal(badgeOf(node({ state: 'unknown', isIncomplete: false, blocksCount: 3 })), null)
 })
 
 test('没有下游时不出徽标', () => {
   assert.equal(badgeOf(node({ isIncomplete: true, blocksCount: 0 })), null)
-  assert.equal(badgeOf(node({ isIncomplete: false, blocksCount: 0 })), null)
+  assert.equal(badgeOf(node({ state: 'done', isIncomplete: false, blocksCount: 0 })), null)
 })

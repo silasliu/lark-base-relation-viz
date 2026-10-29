@@ -3,6 +3,23 @@ import type { GraphRelation } from './services/relationStyles'
 export type { GraphRelation } from './services/relationStyles'
 
 /**
+ * 记录的状态。
+ * - todo：未完成
+ * - done：已完成
+ * - unknown：没有配置状态字段，**不知道**完成与否（不是"未完成"）
+ */
+export type TaskState = 'done' | 'todo' | 'unknown'
+
+/**
+ * 边的状态（决定颜色，不决定线型）。
+ * - blocked：前置未完成，这条关系正在挡路
+ * - ready：前置已完成，可推进
+ * - idle：当前任务已完成，关系已无行动意义
+ * - neutral：状态未知，不做任何判断
+ */
+export type EdgeState = 'blocked' | 'ready' | 'idle' | 'neutral'
+
+/**
  * 一条任务记录（已从 Base 单元格归一化）
  */
 export interface BaseTask {
@@ -12,8 +29,12 @@ export interface BaseTask {
   didaId?: string;
   /** 原始标题（含 emoji，用于滴答搜索跳转） */
   title: string;
-  /** 状态，可能为空 */
+  /** 状态展示文本（选项名称） */
   status: string[];
+  /** 命中的状态选项 key（选项 id 与名称的并集），用于和映射表比对 */
+  statusKeys: string[];
+  /** 完成判定结果 */
+  state: TaskState;
   /** 标签 */
   tags: string[];
   /** 所属清单（分组字段） */
@@ -65,7 +86,9 @@ export interface GraphNode {
   description?: string;
   /** 状态文本（多个值以逗号连接） */
   status: string;
-  /** 是否未完成 */
+  /** 完成状态；unknown = 没有配置状态字段 */
+  state: TaskState;
+  /** 是否未完成（= state === 'todo'，保留给旧调用点） */
   isIncomplete: boolean;
   /** 是否依赖链末端（没有任务依赖它，仅按依赖边算） */
   isTerminal: boolean;
@@ -110,10 +133,8 @@ export interface GraphEdge {
   kind: 'dependency' | 'parent';
   /** 关系 id（关联字段 id）。同一对记录只保留一条边，先到先得 */
   relationId: string;
-  /** 仅依赖边：前置是否已完成 */
-  prerequisiteComplete?: boolean;
-  /** 仅依赖边：任务自身是否已完成（已完成则整条边弱化成灰） */
-  sourceComplete?: boolean;
+  /** 仅依赖边：颜色状态（红/绿/灰/中性） */
+  state?: EdgeState;
 }
 
 export interface GraphData {
@@ -143,6 +164,8 @@ export interface LinkedTaskRef {
   title: string
   emoji: string
   isIncomplete: boolean
+  /** 完成状态；unknown = 未配置状态字段 */
+  state?: TaskState
 }
 
 /** 图布局模式 */

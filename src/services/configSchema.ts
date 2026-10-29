@@ -34,6 +34,16 @@ export interface PersistedConfig {
   /** 侧栏是否收起 */
   sidebarCollapsed?: boolean
   /**
+   * 用来判断「完成 / 未完成」的状态字段（单选或多选）。
+   * 不填 = 中性模式：不判断状态，边统一浅蓝，节点不显示阻塞徽标。
+   */
+  statusFieldId?: string
+  /**
+   * 勾选为「已完成」的选项 key（选项 id 与名称的并集）。
+   * 由用户在界面上勾选，代码不再猜「哪些词算完成」。
+   */
+  doneOptionKeys?: string[]
+  /**
    * 上一次「真的画出了关系」的表。
    * 当前表没有关系数据时会自动切回它，避免用户在统计表上看到一片空白。
    */
@@ -124,6 +134,8 @@ export function migrateConfig(raw: unknown): PersistedConfig {
     ),
     showParent: asBoolean(data.showParent, true),
     sidebarCollapsed: asBoolean(data.sidebarCollapsed, false),
+    statusFieldId: asString(data.statusFieldId),
+    doneOptionKeys: asStringList(data.doneOptionKeys),
     lastGoodTableId: asString(data.lastGoodTableId),
   }
 }

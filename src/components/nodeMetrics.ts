@@ -104,6 +104,9 @@ export type BadgeKind = 'block' | 'unlock'
  * 否则完成的任务还写「阻塞」会让人以为它还在挡路。
  */
 export function badgeOf(node: GraphNode): { text: string; kind: BadgeKind } | null {
+  // 状态未知时不做任何判断：既不写「阻塞」也不写「解锁」，
+  // 否则会让人以为这些任务真的在挡路。
+  if (node.state === 'unknown') return null
   if (node.blocksCount <= 0) return null
   return node.isIncomplete
     ? { text: `阻塞：${node.blocksCount}`, kind: 'block' }
@@ -306,8 +309,7 @@ export function toG6Data(data: GraphData, compact = false) {
       source: edge.source,
       target: edge.target,
       relationId: edge.relationId,
-      prerequisiteComplete: edge.prerequisiteComplete,
-      sourceComplete: edge.sourceComplete,
+      state: edge.state,
       kind: edge.kind,
     })),
   }

@@ -25,6 +25,8 @@ export const COLOR = {
   edgeParent: '#c9cdd4',
   /** 已完成任务引出的依赖边：关系仍存在，但已无行动意义 */
   edgeIdle: '#c9cdd4',
+  /** 状态未知（没有配置状态字段）：不做任何判断，用浅蓝而不是灰 */
+  edgeNeutral: '#a8c0f5',
 } as const
 
 /**
@@ -241,15 +243,20 @@ export function separateOverlaps(graph: any, gap = 16): void {
           }>
           width: number
           height: number
-          node: { isTerminal: boolean; isIncomplete: boolean }
+          node: { isTerminal: boolean; isIncomplete: boolean; state?: 'done' | 'todo' | 'unknown' }
         }
 
         // isTerminal = 没有前置 = 依赖链的**起点**（最容易动手的地方），必须醒目而不是虚化。
         // 真正该淡出的是「没人依赖它」的末端，用 isLeaf 表示。
         const boxOpacity = 1
         const isRoot = node.isTerminal
-        // 未完成 → 红（要处理）；已完成 → 灰绿（弱化，不抢注意力）
-        const accent = node.isIncomplete ? COLOR.danger : COLOR.successMuted
+        // 未完成 → 红（要处理）；已完成 → 灰绿（弱化）；状态未知 → 浅蓝（不做判断）
+        const accent =
+          node.state === 'unknown'
+            ? COLOR.edgeNeutral
+            : node.state === 'done'
+              ? COLOR.successMuted
+              : COLOR.danger
         const left = -width / 2
         const top = -height / 2
 
@@ -542,7 +549,7 @@ export function separateOverlaps(graph: any, gap = 16): void {
       },
 
       draw(cfg: any, group: any) {
-        const { startPoint, endPoint, prerequisiteComplete, sourceComplete, kind, color } = cfg
+        const { startPoint, endPoint, state: edgeState, kind, color } = cfg
         if (!startPoint || !endPoint) return null
 
         const self = this as any
@@ -555,15 +562,16 @@ export function separateOverlaps(graph: any, gap = 16): void {
         // 颜色只表达状态，不表达关系：
         // 父子关系固定灰；依赖关系三态着色，优先级「本任务已完成 → 灰」最高，
         // 因为那时这条关系已经没有行动意义了。
+        const stateColor: Record<string, string> = {
+          idle: COLOR.edgeIdle,
+          ready: COLOR.success,
+          blocked: COLOR.danger,
+          neutral: COLOR.edgeNeutral,
+        }
         const strokeColor =
           kind === 'parent'
             ? COLOR.edgeParent
-            : color ??
-              (sourceComplete
-                ? COLOR.edgeIdle
-                : prerequisiteComplete
-                  ? COLOR.success
-                  : COLOR.danger)
+            : color ?? stateColor[edgeState as string] ?? COLOR.danger
 
         const attrs: Record<string, unknown> = {
           path,

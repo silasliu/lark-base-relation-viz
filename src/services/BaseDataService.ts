@@ -1,9 +1,10 @@
 import { bitable, FieldType } from '@lark-base-open/js-sdk'
-import type { BaseTask, GraphData, TableOption, LinkFieldOption, BuildOptions } from '../types'
+import type { BaseTask, GraphData, TableOption, LinkFieldOption, BuildOptions, TaskState } from '../types'
 import { config } from '../config'
 import { buildGraphData } from './graphBuilder'
 import { readAllPages } from './pagination'
-import { cellToRecordIds, looksLikeLinkCell } from './cellValues'
+import { cellToRecordIds, cellToOptionKeys, looksLikeLinkCell } from './cellValues'
+import { stateFromKeys } from './statusMapping'
 
 /**
  * 开发调试回退：在飞书宿主之外（浏览器直接打开）时，SDK 永不 resolve。
@@ -124,9 +125,28 @@ function cellToDate(value: unknown): string | undefined {
   return text.slice(0, 10)
 }
 
-/** 读取进度回调 */
+/** 读取参数 */
 export interface LoadProgress {
   onProgress?: (loaded: number, total?: number) => void
+  /** 状态字段 id。不给 = 中性模式（不知道完成与否） */
+  statusFieldId?: string
+  /** 勾选为「已完成」的选项 key（选项 id 与名称的并集） */
+  doneOptionKeys?: string[]
+}
+
+/** 一个状态选项 */
+export interface StatusOption {
+  id: string
+  name: string
+  color: number
+}
+
+/** 可以作为「完成状态」来源的字段（单选 / 多选） */
+export interface StatusFieldMeta {
+  id: string
+  name: string
+  multiple: boolean
+  options: StatusOption[]
 }
 
 /** 关联字段扫描结果（含跨表字段，用于诊断） */
@@ -262,6 +282,54 @@ export class BaseDataService {
   }
 
   /**
+   * 扫描可以作为「完成状态」来源的字段（单选 / 多选），连同它们的选项。
+   * 有了选项列表，用户就能直接勾「哪些选项算完成」，不用靠代码猜词。
+   */
+  async scanStatusFields(tableId: string): Promise<StatusFieldMeta[]> {
+    if ((await this.ensureMode()) === 'mock') {
+      const mock = await loadMock()
+      const metas = mock._fieldMeta ?? []
+      const statusMeta = metas.find((m) => m.name === config.optionalFields.status)
+      if (!statusMeta) return []
+      // mock 没有字段选项元数据，退而从记录里收集出现过的值
+      const names = new Set<string>()
+      for (const record of mock.records) {
+        for (const name of cellToArray(record.fields[statusMeta.id])) names.add(name)
+      }
+      return [
+        {
+          id: statusMeta.id,
+          name: statusMeta.name,
+          multiple: false,
+          options: [...names].map((name, index) => ({ id: `opt_${name}`, name, color: index })),
+        },
+      ]
+    }
+
+    const table = await withTimeout(bitable.base.getTableById(tableId), HOST_TIMEOUT_MESSAGE)
+    const metas = await withTimeout(table.getFieldMetaList(), HOST_TIMEOUT_MESSAGE)
+
+    const result: StatusFieldMeta[] = []
+    for (const meta of metas) {
+      const isSingle = meta.type === FieldType.SingleSelect
+      const isMulti = meta.type === FieldType.MultiSelect
+      if (!isSingle && !isMulti) continue
+      const property = (meta as {
+        property?: { options?: Array<{ id?: string; name?: string; color?: number }> }
+      }).property
+      const options: StatusOption[] = []
+      for (const option of property?.options ?? []) {
+        const id = typeof option?.id === 'string' ? option.id : ''
+        const name = typeof option?.name === 'string' ? option.name : ''
+        if (!id && !name) continue
+        options.push({ id, name, color: typeof option?.color === 'number' ? option.color : 0 })
+      }
+      result.push({ id: meta.id, name: meta.name, multiple: isMulti, options })
+    }
+    return result
+  }
+
+  /**
    * 某张表里的自关联字段（可作为依赖或父子来源）。
    * 只有「关联到本表自己」的字段才有图上的语义，跨表关联不参与。
    */
@@ -324,6 +392,8 @@ export class BaseDataService {
           .find((id) => Boolean(id)),
         dependencyFieldIds: depFieldIds,
         parentFieldId,
+        statusFieldId: progress.statusFieldId,
+        doneKeys: new Set(progress.doneOptionKeys ?? []),
       })
     }
 
@@ -347,6 +417,8 @@ export class BaseDataService {
         .find((id) => Boolean(id)),
       dependencyFieldIds: depFieldIds,
       parentFieldId,
+      statusFieldId: progress.statusFieldId,
+      doneKeys: new Set(progress.doneOptionKeys ?? []),
     }
 
     type RawRecord = { recordId: string; fields: Record<string, unknown> }
@@ -398,6 +470,10 @@ function normalizeRecords(
     descriptionId?: string
     dependencyFieldIds: string[]
     parentFieldId?: string
+    /** 状态字段（单选/多选）。不给 = 中性模式 */
+    statusFieldId?: string
+    /** 勾选为已完成的选项 key */
+    doneKeys?: Set<string>
   },
 ): BaseTask[] {
   const tasks: BaseTask[] = []
@@ -412,11 +488,19 @@ function normalizeRecords(
       for (const ref of refs) if (!merged.includes(ref)) merged.push(ref)
     }
 
+    const statusKeys = ids.statusFieldId ? cellToOptionKeys(get(ids.statusFieldId)) : []
+    const state: TaskState = ids.statusFieldId
+      ? stateFromKeys(statusKeys, ids.doneKeys ?? new Set())
+      : 'unknown'
+
     tasks.push({
       recordId: record.recordId,
       didaId: cellToText(get(ids.didaIdFieldId)) || undefined,
       title: ids.titleId ? cellToText(get(ids.titleId)) : '',
-      status: cellToArray(get(ids.statusId)),
+      // 展示用：优先用配置的状态字段，没配置就沿用名字匹配到的那个
+      status: cellToArray(get(ids.statusFieldId ?? ids.statusId)),
+      statusKeys,
+      state,
       tags: cellToArray(get(ids.tagsId)),
       dueDate: cellToDate(get(ids.dueId)),
       prerequisitesByField,

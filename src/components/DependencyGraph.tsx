@@ -156,11 +156,7 @@ function syncGraphData(graph: Graph, data: GraphData, compact: boolean, vertical
         // 只改颜色/主轴时也要发出更新：锚点由 getLinkPoint 动态计算，
         // 但主轴与颜色变化仍需要触发重绘
         const prev = existing.getModel() as Record<string, unknown>
-        if (
-          prev.prerequisiteComplete !== model.prerequisiteComplete ||
-          prev.sourceComplete !== model.sourceComplete ||
-          prev.axis !== model.axis
-        ) {
+        if (prev.state !== model.state || prev.axis !== model.axis) {
           graph.updateItem(existing, model, false)
         }
       } else {

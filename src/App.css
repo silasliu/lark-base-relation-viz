@@ -1435,3 +1435,19 @@
   line-height: 1.8;
   word-break: break-all;
 }
+
+/* 状态未知的边与图例 */
+.legend-edge.dep-neutral {
+  border-color: #a8c0f5;
+}
+
+.settings-note {
+  font-size: 11px;
+  color: #a9aeb8;
+}
+
+/* 详情里的「状态未知」胶囊 */
+.pill-neutral {
+  background: #eef3fe;
+  color: #5b7fd1;
+}

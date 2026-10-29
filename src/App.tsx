@@ -2,11 +2,12 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { DependencyGraph } from './components/DependencyGraph'
 import { ChecklistPanel } from './components/ChecklistPanel'
 import { DetailsPanel } from './components/DetailsPanel'
-import { BaseDataService, type ScannedLinkField } from './services/BaseDataService'
+import { BaseDataService, type ScannedLinkField, type StatusFieldMeta } from './services/BaseDataService'
 import { loadConfig, saveConfig, type PersistedConfig, type DependencyRole, type ParentRole } from './services/ConfigStore'
 import { applyCollapse, collapsibleKinds, EMPTY_COLLAPSE, type CollapseState } from './services/collapse'
 import { watchTable } from './services/DataWatcher'
 import { chooseTableId } from './services/tableChoice'
+import { guessDoneKeys } from './services/statusMapping'
 import type {
   GraphNode,
   GraphData,
@@ -35,6 +36,12 @@ function App() {
   /** 参与绘制的依赖字段，第一个为主字段。多选 = 同时显示多种依赖关系 */
   const [depFieldIds, setDepFieldIds] = useState<string[]>([])
   const [parentFieldId, setParentFieldId] = useState('')
+  /** 可选作「完成状态」来源的字段（单选/多选）及其选项 */
+  const [statusFields, setStatusFields] = useState<StatusFieldMeta[]>([])
+  /** 当前选中的状态字段；空字符串 = 中性模式 */
+  const [statusFieldId, setStatusFieldId] = useState('')
+  /** 勾选为「已完成」的选项 key（选项 id 与名称的并集） */
+  const [doneOptionKeys, setDoneOptionKeys] = useState<string[]>([])
   const [depRole, setDepRole] = useState<DependencyRole>('fieldIsPrereq')
   const [parentRole, setParentRole] = useState<ParentRole>('fieldIsParent')
   const [showParent, setShowParent] = useState(true)
@@ -191,6 +198,31 @@ function App() {
           .map((f) => ({ id: f.id, name: f.name, targetTableId: f.targetTableId }))
         setFields(list)
 
+        // 完成状态：只列单选/多选字段。没配置过就按名字猜一个（状态/status/stage），
+        // 并按选项名给一版初始勾选；用户改一次就持久化，之后不再猜。
+        const statusScans = await service.scanStatusFields(tableId).catch(() => [])
+        if (cancelled) return
+        setStatusFields(statusScans)
+
+        const savedCfg = configRef.current
+        const savedStatus = statusScans.find((f) => f.id === savedCfg?.statusFieldId)
+        const guessed =
+          savedStatus ??
+          statusScans.find((f) => /状态|status|stage|进度/i.test(f.name))
+        if (guessed) {
+          const keys =
+            savedStatus && (savedCfg?.doneOptionKeys?.length ?? 0) > 0
+              ? savedCfg!.doneOptionKeys!
+              : guessDoneKeys(guessed.options)
+          setStatusFieldId(guessed.id)
+          setDoneOptionKeys(keys)
+          persist({ statusFieldId: guessed.id, doneOptionKeys: keys })
+        } else {
+          setStatusFieldId('')
+          setDoneOptionKeys([])
+          persist({ statusFieldId: undefined, doneOptionKeys: [] })
+        }
+
         const saved = configRef.current
         const savedDeps = (saved?.dependencyFieldIds ?? []).filter((id) =>
           list.some((f) => f.id === id),
@@ -255,7 +287,11 @@ function App() {
         tableId,
         depFieldIds,
         showParent ? parentFieldId || undefined : undefined,
-        { onProgress: onReadProgress },
+        {
+          onProgress: onReadProgress,
+          statusFieldId: statusFieldId || undefined,
+          doneOptionKeys,
+        },
       )
       if (seq !== analyzeSeq.current) return
 
@@ -309,7 +345,7 @@ function App() {
         setReadProgress('')
       }
     }
-  }, [tableId, depFieldIds, parentFieldId, showParent, service, buildOptions, onReadProgress, tables, fields, showToast, persist])
+  }, [tableId, depFieldIds, parentFieldId, showParent, service, buildOptions, onReadProgress, tables, fields, showToast, persist, statusFieldId, doneOptionKeys])
 
   /** 静默刷新：保留选中、折叠、缩放，只更新数据 */
   const silentAnalyze = useCallback(async () => {
@@ -320,7 +356,11 @@ function App() {
         tableId,
         depFieldIds,
         showParent ? parentFieldId || undefined : undefined,
-        { onProgress: onReadProgress },
+        {
+          onProgress: onReadProgress,
+          statusFieldId: statusFieldId || undefined,
+          doneOptionKeys,
+        },
       )
       if (seq !== analyzeSeq.current) return
       const data = service.buildGraphData(tasks, buildOptions())
@@ -333,7 +373,7 @@ function App() {
     } finally {
       if (seq === analyzeSeq.current) setReadProgress('')
     }
-  }, [tableId, depFieldIds, parentFieldId, showParent, service, buildOptions, onReadProgress])
+  }, [tableId, depFieldIds, parentFieldId, showParent, service, buildOptions, onReadProgress, statusFieldId, doneOptionKeys])
 
   // 实时监听表格变更
   useEffect(() => {
@@ -359,11 +399,11 @@ function App() {
   const autoKey = useRef('')
   useEffect(() => {
     if (!tableId || depFieldIds.length === 0) return
-    const key = `${tableId}|${depFieldIds.join(',')}|${showParent ? parentFieldId : ''}|${depRole}|${parentRole}`
+    const key = `${tableId}|${depFieldIds.join(',')}|${showParent ? parentFieldId : ''}|${depRole}|${parentRole}|${statusFieldId}|${doneOptionKeys.join(',')}`
     if (autoKey.current === key) return
     autoKey.current = key
     void analyze()
-  }, [tableId, depFieldIds, parentFieldId, showParent, depRole, parentRole, analyze])
+  }, [tableId, depFieldIds, parentFieldId, showParent, depRole, parentRole, statusFieldId, doneOptionKeys, analyze])
 
   /** 折叠后的视图 */
   const viewData = useMemo(
@@ -529,6 +569,9 @@ function App() {
   const displayData = viewData?.data ?? graphData
   const collapsedCount = collapse.parents.size + collapse.deps.size
   const extraDepFields = fields.filter((f) => f.id !== primaryDepFieldId)
+  const activeStatusField = statusFields.find((f) => f.id === statusFieldId)
+  const hasStatus = Boolean(statusFieldId)
+  const hasNeutralEdge = Boolean(displayData?.edges.some((e) => e.state === 'neutral'))
 
   return (
     <div className={`app-container ${immersive ? 'immersive' : ''}`} ref={appRef}>
@@ -710,6 +753,62 @@ function App() {
               <span>显示父子关系</span>
             </label>
 
+            <label className="settings-row inline">
+              <span>完成状态</span>
+              <select
+                value={statusFieldId}
+                onChange={(e) => {
+                  const next = e.target.value
+                  const field = statusFields.find((f) => f.id === next)
+                  const keys = field ? guessDoneKeys(field.options) : []
+                  setStatusFieldId(next)
+                  setDoneOptionKeys(keys)
+                  persist({ statusFieldId: next || undefined, doneOptionKeys: keys })
+                }}
+                disabled={analyzing}
+              >
+                <option value="">不用状态（中性）</option>
+                {statusFields.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {statusFieldId && (
+              <div className="settings-row inline dep-extra">
+                <span>算完成</span>
+                {activeStatusField && activeStatusField.options.length > 0 ? (
+                  activeStatusField.options.map((option) => {
+                    const checked = doneOptionKeys.includes(option.id || option.name)
+                    return (
+                      <label key={option.id || option.name} className="check-inline">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => {
+                            const keys = new Set(doneOptionKeys)
+                            for (const key of [option.id, option.name]) {
+                              if (!key) continue
+                              if (e.target.checked) keys.add(key)
+                              else keys.delete(key)
+                            }
+                            const next = [...keys]
+                            setDoneOptionKeys(next)
+                            persist({ doneOptionKeys: next })
+                          }}
+                        />
+                        <span>{option.name}</span>
+                      </label>
+                    )
+                  })
+                ) : (
+                  <span className="settings-note">这个字段没有选项，勾不了</span>
+                )}
+              </div>
+            )}
+
             {extraDepFields.length > 0 && (
               <div className="settings-row inline dep-extra">
                 <span>同时显示</span>
@@ -790,6 +889,7 @@ function App() {
                 {depField ? `依赖：${depField.name}` : ''}
                 {depFieldIds.length > 1 && ` 等 ${depFieldIds.length} 个字段`}
                 {showParent && parentField ? `｜父子：${parentField.name}` : ''}
+                {activeStatusField ? `｜状态：${activeStatusField.name}` : '｜状态：中性'}
                 {collapsedCount > 0 && (
                   <button className="reset-collapse" onClick={() => setCollapse(EMPTY_COLLAPSE)}>
                     展开全部
@@ -874,6 +974,7 @@ function App() {
                       onLocate={handleLocate}
                       filter={filter}
                       onFilterChange={setFilter}
+                      hasStatus={hasStatus}
                     />
                   ) : (
                     <DetailsPanel
@@ -909,6 +1010,12 @@ function App() {
                     <span className="legend-edge dep-idle" />
                     已失效：本任务已完成
                   </div>
+                  {hasNeutralEdge && (
+                    <div className="legend-item">
+                      <span className="legend-edge dep-neutral" />
+                      状态未知：未配置完成状态
+                    </div>
+                  )}
                 </div>
               </>
             )}

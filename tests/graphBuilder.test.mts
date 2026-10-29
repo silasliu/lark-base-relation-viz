@@ -8,6 +8,8 @@ function task(recordId: string, extra: Partial<BaseTask> = {}): BaseTask {
     recordId,
     title: `${recordId} 任务`,
     status: ['打开'],
+    statusKeys: [],
+    state: 'todo',
     tags: [],
     prerequisites: [],
     ...extra,
@@ -45,7 +47,7 @@ test('菱形依赖不重复计数', () => {
 test('已完成的下游任务不计入传递阻塞数', () => {
   const data = buildGraphData([
     task('A'),
-    task('B', { prerequisites: ['A'], status: ['已完成'] }),
+    task('B', { prerequisites: ['A'], state: 'done' }),
   ])
 
   const a = data.nodes.find((n) => n.recordId === 'A')
@@ -54,17 +56,16 @@ test('已完成的下游任务不计入传递阻塞数', () => {
 
 test('依赖边颜色状态：前置完成=可推进，本任务完成=失效', () => {
   const data = buildGraphData([
-    task('A', { status: ['已完成'] }),
+    task('A', { state: 'done' }),
     task('B', { prerequisites: ['A'] }),
-    task('C', { prerequisites: ['B'], status: ['已完成'] }),
+    task('C', { prerequisites: ['B'], state: 'done' }),
   ])
 
   const bToA = data.edges.find((e) => e.source === 'B' && e.target === 'A')
-  assert.equal(bToA?.prerequisiteComplete, true)
-  assert.equal(bToA?.sourceComplete, false)
+  assert.equal(bToA?.state, 'ready')
 
   const cToB = data.edges.find((e) => e.source === 'C' && e.target === 'B')
-  assert.equal(cToB?.sourceComplete, true)
+  assert.equal(cToB?.state, 'idle')
 })
 
 test('表命名空间：节点 id 加前缀，recordId 保持原样', () => {
@@ -159,8 +160,8 @@ test('只有父子关系、没有任何依赖时不产生图（种子只看依�
 
 test('只有已完成任务时不会凭空生出节点', () => {
   const data = buildGraphData([
-    task('A', { status: ['已完成'] }),
-    task('B', { status: ['已完成'], prerequisites: ['A'] }),
+    task('A', { state: 'done' }),
+    task('B', { state: 'done', prerequisites: ['A'] }),
   ])
   assert.deepEqual(data.nodes, [])
   assert.deepEqual(data.edges, [])

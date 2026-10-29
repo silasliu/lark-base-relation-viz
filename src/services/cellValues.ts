@@ -66,3 +66,34 @@ export function looksLikeLinkCell(value: unknown): boolean {
     (typeof link.id === 'string' && RECORD_ID_RE.test(link.id))
   )
 }
+
+/**
+ * 单选 / 多选单元格 → 选项 key（选项 id 与名称的并集）。
+ *
+ * 不同版本返回 `{ id, text }`、`{ id, name }` 或纯字符串，
+ * 这里全部收下来，完成判定时再用「id 或名称」任一命中即可。
+ */
+export function cellToOptionKeys(value: unknown): string[] {
+  if (value == null) return []
+  const items = Array.isArray(value) ? value : [value]
+  const keys: string[] = []
+  const push = (raw: unknown) => {
+    if (typeof raw !== 'string') return
+    const text = raw.trim()
+    if (text && !keys.includes(text)) keys.push(text)
+  }
+
+  for (const item of items) {
+    if (item == null) continue
+    if (typeof item === 'string') {
+      push(item)
+      continue
+    }
+    if (typeof item !== 'object') continue
+    const option = item as { id?: unknown; text?: unknown; name?: unknown }
+    push(option.id)
+    push(option.text)
+    push(option.name)
+  }
+  return keys
+}

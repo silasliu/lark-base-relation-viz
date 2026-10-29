@@ -96,14 +96,19 @@ export function DetailsPanel({
     <div className="details">
       <div className="details-head">
         <span className="details-emoji">{node.emoji}</span>
-        <span className={`details-title-text ${node.isIncomplete ? '' : 'done-text'}`}>
+        <span className={`details-title-text ${node.state === 'done' ? 'done-text' : ''}`}>
           {node.label}
         </span>
       </div>
 
       <div className="details-badges">
-        <span className={`pill ${node.isIncomplete ? 'pill-todo' : 'pill-done'}`}>
-          {node.status || (node.isIncomplete ? '未完成' : '已完成')}
+        <span
+          className={`pill ${
+            node.state === 'done' ? 'pill-done' : node.state === 'todo' ? 'pill-todo' : 'pill-neutral'
+          }`}
+        >
+          {node.status ||
+            (node.state === 'done' ? '已完成' : node.state === 'todo' ? '未完成' : '状态未知')}
         </span>
         {node.overdueDays ? <span className="pill pill-danger">逾期 {node.overdueDays} 天</span> : null}
         {node.listName && (
@@ -147,7 +152,7 @@ export function DetailsPanel({
           </h4>
           <ul className="related-list">
             {prereqNodes.map((r) =>
-              relatedRow(r.id, `${r.emoji} ${r.title}`, !r.isIncomplete),
+              relatedRow(r.id, `${r.emoji} ${r.title}`, r.state === 'done'),
             )}
           </ul>
         </div>
@@ -157,7 +162,7 @@ export function DetailsPanel({
         <div className="details-section">
           <h4>这些在等它</h4>
           <ul className="related-list">
-            {succNodes.map((r) => relatedRow(r.id, `${r.emoji} ${r.title}`, !r.isIncomplete))}
+            {succNodes.map((r) => relatedRow(r.id, `${r.emoji} ${r.title}`, r.state === 'done'))}
           </ul>
         </div>
       )}
